@@ -23,126 +23,20 @@ jobs:
       - name: Apply DLSS-NR Auto Exposure patch in runner only
         shell: powershell
         run: |
-          # The patcher was authored against an older encode block where WhitePoint and Width
-          # were adjacent. In the clean upstream source there is now a comment between them.
-          # Fix only the runner copy of the patcher. Nothing is committed back to source files.
-          $patcher = "${{ github.workspace }}\tools\apply_dlssnr_autoexposure.py"
-          $lines = [System.Collections.Generic.List[string]]::new()
-          Get-Content $patcher | ForEach-Object { [void]$lines.Add($_) }
-
-          $matches = @()
-          for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -like '*encodeParams.Width = width*') {
-              $matches += $i
-            }
-          }
-
-          if ($matches.Count -ne 2) {
-            Write-Error "Expected exactly two stale encode Width anchors in the patcher, found $($matches.Count)."
-            exit 1
-          }
-
-          # Remove the stale Width line from both the search anchor and replacement text.
-          # Add the comma to the preceding Python string literal first, otherwise removing
-          # the line merges function arguments and causes replace_once() TypeError.
-          for ($j = $matches.Count - 1; $j -ge 0; $j--) {
-            $idx = $matches[$j]
-            $prev = $idx - 1
-            if (-not $lines[$prev].TrimEnd().EndsWith(',')) {
-              $lines[$prev] = $lines[$prev] + ','
-            }
-            $lines.RemoveAt($idx)
-          }
-
-          [System.IO.File]::WriteAllLines(
-            $patcher,
-            $lines,
-            [System.Text.UTF8Encoding]::new($false)
-          )
-
-          python -c "import ast,pathlib; p=pathlib.Path(r'.\tools\apply_dlssnr_autoexposure.py'); ast.parse(p.read_text(encoding='utf-8')); print('patcher syntax OK')"
+          python -m py_compile .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # Final v5 corrections on the temporary runner copy only:
-          # - Automatic exposure trim has the same 0.25x..10x range as game exposure.
-          # - Scan meter / anchors / calibration UI belong ONLY to "A buffer the scan found" (source 3).
-          # - The scan itself must not start merely because Automatic exposure (source 2) is selected.
-          function Replace-Checked {
-            param(
-              [string]$Path,
-              [string]$Old,
-              [string]$New,
-              [int]$Expected,
-              [string]$Label
-            )
-
-            $text = [System.IO.File]::ReadAllText($Path)
-            $count = ([regex]::Matches($text, [regex]::Escape($Old))).Count
-            if ($count -ne $Expected) {
-              Write-Error ("{0}: expected {1} match(es), found {2} in {3}" -f $Label, $Expected, $count, $Path)
-              exit 1
-            }
-            $text = $text.Replace($Old, $New)
-            [System.IO.File]::WriteAllText($Path, $text, [System.Text.UTF8Encoding]::new($false))
-          }
-
-          $menuPath = "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp"
-          Replace-Checked $menuPath `
-            '"Trim (x automatic exposure)", &autoTrim, 0.25f, 4.0f' `
-            '"Trim (x automatic exposure)", &autoTrim, 0.25f, 10.0f' `
-            1 'automatic exposure slider max'
-          Replace-Checked $menuPath `
-            'std::clamp(autoTrim, 0.25f, 4.0f)' `
-            'std::clamp(autoTrim, 0.25f, 10.0f)' `
-            1 'automatic exposure UI clamp'
-          Replace-Checked $menuPath `
-            'Range: 0.25x to 4.00x.' `
-            'Range: 0.25x to 10.00x.' `
-            1 'automatic exposure help range'
-
-          # Hide the complete scan meter / anchor / calibration section unless source 3 is selected.
-          Replace-Checked $menuPath `
-            "        {`n            // No checkbox here any more." `
-            "        if (wpSource == 3)`n        {`n            // No checkbox here any more." `
-            1 'scan UI source guard'
-          Replace-Checked $menuPath `
-            'if (config->DlssNrWhitePointSource.value_or_default() == 2 &&' `
-            'if (config->DlssNrWhitePointSource.value_or_default() == 3 &&' `
-            1 'scan meter source index'
-          Replace-Checked $menuPath `
-            'const bool isSource = config->DlssNrWhitePointSource.value_or_default() == 2;' `
-            'const bool isSource = config->DlssNrWhitePointSource.value_or_default() == 3;' `
-            1 'scan anchor source index'
-
-          $scanPath = "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_ExposureScan.cpp"
-          Replace-Checked $scanPath `
-            'DlssNrWhitePointSource.value_or_default() == 2 ||' `
-            'DlssNrWhitePointSource.value_or_default() == 3 ||' `
-            1 'scan runtime source index'
-
-          $dx12Path = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Dx12.cpp"
-          Replace-Checked $dx12Path `
-            'std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 4.0f)' `
-            'std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 10.0f)' `
-            2 'automatic exposure backend trim clamps'
-
-          $hlslPath = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl"
-          Replace-Checked $hlslPath `
-            'const float trim = clamp(gExposureTrim, 0.25, 4.0);' `
-            'const float trim = clamp(gExposureTrim, 0.25, 10.0);' `
-            1 'automatic exposure shader trim clamp'
-
           # Structural checks before spending time on FXC/MSBuild.
-          $dx12 = Get-Content $dx12Path -Raw
-          $menu = Get-Content $menuPath -Raw
-          $scan = Get-Content $scanPath -Raw
-          $hlsl = Get-Content $hlslPath -Raw
+          $dx12 = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Dx12.cpp" -Raw
+          $menu = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
+          $scan = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_ExposureScan.cpp" -Raw
+          $hlsl = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl" -Raw
 
-          if ($dx12 -notmatch 'UseExposureWhitePoint' -or
-              $dx12 -notmatch 'automaticExposureSelected' -or
+          if ($dx12 -notmatch 'automaticExposureSelected' -or
+              $dx12 -notmatch 'DlssNrAutoExposureTrim\.value_or_default\(\), 0\.25f, 10\.0f' -or
               $menu -notmatch 'Automatic exposure' -or
               $menu -notmatch 'Trim \(x automatic exposure\).*10\.0f' -or
               $menu -notmatch 'if \(wpSource == 3\)' -or
@@ -251,9 +145,9 @@ jobs:
 
           White point sources:
           - Paper white only;
-          - The game's own exposure: uses only the game's ExposureTexture, with trim up to 10x;
+          - The game's own exposure: uses only the game's ExposureTexture, trim up to 10x;
           - Automatic exposure: always calculates exposure on GPU from original linear HDR, ignores game ExposureTexture, trim up to 10x;
-          - A buffer the scan found: existing calibrated scan path, including meter and anchors.
+          - A buffer the scan found: calibrated scan path; meter and anchors appear only for this source.
 
           Automatic exposure is calculated once before Encode and the same 1x1 value is reused by Encode, all NR passes and Resolve.
 
