@@ -19,8 +19,9 @@ enum DlssNrMode : uint32_t
     DlssNrMode_Encode = 0,     // the frame -> a tone-mapped proxy, plus an untouched copy
     DlssNrMode_Resolve = 1,    // proxy + the model's answer + the untouched copy -> the edited frame
     DlssNrMode_Downsample = 2, // the proxy -> a smaller proxy, when the model works below full size
-    DlssNrMode_Meter = 3,      // the exposure texture -> tile (0,0), for the white point
-    DlssNrMode_Calibrate = 4   // the untouched frame -> a grid of tile peak luminances
+    DlssNrMode_Meter = 3,      // exposure copy, or frame -> 64x64 tile luminance means
+    DlssNrMode_Calibrate = 4,  // the untouched frame -> a grid of tile peak luminances
+    DlssNrMode_AutoExposure = 5 // 64x64 tile means -> NVIDIA-style 1x1 exposure
 };
 
 // The meter's grid. 64 x 64 tiles over the whole frame, whatever its size.
@@ -164,6 +165,14 @@ struct alignas(256) DlssNrConstants
     // two captures at different exposures then differ by the exposure, whatever the edit did. This
     // is the user's own multiplier, which holds still while the meter works.
     float DebugScale;
+
+    // D3D12 GPU auto exposure. Appended so all existing offsets remain unchanged.
+    float PreExposure;
+    float ExposureTrim;
+    uint32_t ExposureSourceWidth;
+    uint32_t ExposureSourceHeight;
+    uint32_t UseExposureTexture;
+    uint32_t MeterCopiesExposure;
 };
 
 class DlssNr_Common

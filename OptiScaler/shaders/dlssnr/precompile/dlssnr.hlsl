@@ -25,6 +25,14 @@ cbuffer Params : register(b0)
     uint  gCompareSwap;  // put the edited frame on the other side
     uint  gTransfer;     // 0 classic, 1 matched residual -- how a below-size model comes back
     float gDebugScale;   // what the debug views are scaled by, held still while the meter moves
+
+    // GPU auto exposure. Appended so every existing constant keeps its offset.
+    float gPreExposure;
+    float gExposureTrim;
+    uint  gExposureSourceWidth;
+    uint  gExposureSourceHeight;
+    uint  gUseExposureTexture;
+    uint  gMeterCopiesExposure;
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -217,7 +225,14 @@ Texture2D<float4>   gOriginal : register(t2);  // resolve: the untouched frame.
 #ifdef VK_MODE
 [[vk::binding(4, 0)]]
 #endif
-Texture2D<float4>   gMotion   : register(t3);  // resolve, accumulating: the game's motion vectors.
+Texture2D<float4>   gMotion   : register(t3);  // resolve: the game's motion vectors.
+
+// D3D12 already allocates five SRVs; t4 was the vestigial accumulator-history slot.
+// Keep Vulkan's descriptor layout unchanged.
+#ifndef VK_MODE
+Texture2D<float4>   gExposure : register(t4);  // game or GPU-generated 1x1 exposure.
+#endif
+
 #ifdef VK_MODE
 [[vk::binding(5, 0)]]
 #endif
@@ -330,6 +345,34 @@ float3 CubeScaleResidual(float3 P, float3 T)
     return P + saturate(alpha) * d;
 }
 
+
+// White point used by both Encode and Resolve.
+//
+// The CPU value remains the manual / scan fallback. On D3D12, when a real exposure
+// resource is available, both passes derive the divisor from the SAME 1x1 value.
+float CompositionWhitePoint()
+{
+    float whitePoint = max(gWhitePoint, 1e-4);
+
+#ifndef VK_MODE
+    if (gUseExposureTexture != 0 && gPassthrough == 0)
+    {
+        const float exposure = gExposure.Load(int3(0, 0, 0)).r;
+        const float preExposure =
+            (isfinite(gPreExposure) && gPreExposure > 1e-6) ? gPreExposure : 1.0;
+        const float trim =
+            (isfinite(gExposureTrim) && gExposureTrim > 0.0)
+                ? clamp(gExposureTrim, 0.25, 4.0)
+                : 1.0;
+
+        if (isfinite(exposure) && exposure > 1e-8)
+            whitePoint = clamp((preExposure / exposure) * trim, 0.01, 4096.0);
+    }
+#endif
+
+    return max(whitePoint, 1e-4);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -365,6 +408,69 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // nothing about scale; the peak says where the top of the range is, which is exactly what the
     // divisor has to match. One specular hit cannot decide the answer because the host takes a
     // percentile across tiles afterwards.
+    // Reduce the 64x64 meter into NVIDIA's DLSS exposure formula.
+    //
+    // The meter stores one arithmetic mean per tile. Weighting by each tile's exact
+    // source-pixel area reconstructs the arithmetic AverageLuma of the entire source.
+    if (gMode == 5)
+    {
+        if (id.x != 0 || id.y != 0)
+            return;
+
+        const uint srcW = max(gExposureSourceWidth, 1u);
+        const uint srcH = max(gExposureSourceHeight, 1u);
+
+        float weightedLuma = 0.0;
+        float totalPixels = 0.0;
+
+        [loop] for (uint ty = 0; ty < 64u; ++ty)
+        {
+            const uint y0 = (ty * srcH) / 64u;
+            const uint y1 = ((ty + 1u) * srcH) / 64u;
+            const uint tileH = y1 > y0 ? y1 - y0 : 0u;
+
+            [loop] for (uint tx = 0; tx < 64u; ++tx)
+            {
+                const uint x0 = (tx * srcW) / 64u;
+                const uint x1 = ((tx + 1u) * srcW) / 64u;
+                const uint tileW = x1 > x0 ? x1 - x0 : 0u;
+
+                if (tileW == 0u || tileH == 0u)
+                    continue;
+
+                const float pixels = (float) tileW * (float) tileH;
+                const float tileMean =
+                    max(SanitizeFinite(gSource.Load(int3(tx, ty, 0)).r, 0.0), 0.0);
+
+                weightedLuma += tileMean * pixels;
+                totalPixels += pixels;
+            }
+        }
+
+        const float averageBufferLuma =
+            totalPixels > 0.0 ? weightedLuma / totalPixels : 0.0;
+
+        const float preExposure =
+            (isfinite(gPreExposure) && gPreExposure > 1e-6) ? gPreExposure : 1.0;
+
+        // buffer = scene * PreExposure
+        const float averageSceneLuma = averageBufferLuma / preExposure;
+
+        // NVIDIA DLSS Programming Guide:
+        // Exposure = MidGray / (AverageLuma * (1 - MidGray)), MidGray = 0.18.
+        float exposure =
+            averageSceneLuma > 1e-8
+                ? 0.18 / (averageSceneLuma * 0.82)
+                : 1.0;
+
+        if (!isfinite(exposure) || exposure <= 0.0)
+            exposure = 1.0;
+
+        exposure = clamp(exposure, 1e-6, 1e6);
+        gTarget[uint2(0, 0)] = float4(exposure, 0.0, 0.0, 1.0);
+        return;
+    }
+
     if (gMode == 4)
     {
         uint fullW, fullH;
@@ -402,17 +508,13 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     if (gMode == 3)
     {
-        // Tile (0,0) carries the game's own exposure rather than a tile mean.
-        //
-        // The exposure is a 1x1 texture the game owns, in a resource state this pass did not set and
-        // must not assume. Copying it would mean transitioning someone else's resource on a guess,
-        // which is how a device is lost. Reading it as an SRV in a pass that is already running costs
-        // nothing and touches no state -- and it rides back on the readback that already exists.
-        //
-        // The motion slot is free here: the meter has no use for motion vectors.
-        if (id.x == 0 && id.y == 0)
+        // Preserve the old game-exposure courier. AUTO sets this flag to zero and
+        // uses the same mode as a true 64x64 luminance grid, including tile (0,0).
+        if (gMeterCopiesExposure != 0)
         {
-            gTarget[id.xy] = float4(gMotion.Load(int3(0, 0, 0)).r, 0.0, 0.0, 1.0);
+            if (id.x == 0 && id.y == 0)
+                gTarget[id.xy] = float4(gMotion.Load(int3(0, 0, 0)).r, 0.0, 0.0, 1.0);
+
             return;
         }
 
@@ -424,21 +526,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         const uint ty0 = (uint) (((float) id.y * (float) fullH) / (float) gHeight);
         const uint ty1 = (uint) (((float) (id.y + 1) * (float) fullH) / (float) gHeight);
 
-        // A tile of a 4K frame is 60x34 pixels. Sampling a bounded number of them is within a percent
-        // of the true mean and keeps the pass flat regardless of resolution.
-        const uint stepX = max((tx1 - tx0) / 8u, 1u);
-        const uint stepY = max((ty1 - ty0) / 8u, 1u);
-
+        // Exact arithmetic tile mean. Across 4096 threads every source pixel is
+        // read exactly once; mode 5 weights the tile means by exact tile area.
         float sum = 0.0;
         uint taken = 0;
 
-        for (uint ty = ty0; ty < max(ty1, ty0 + 1u); ty += stepY)
+        [loop] for (uint ty = ty0; ty < max(ty1, ty0 + 1u); ++ty)
         {
-            for (uint tx = tx0; tx < max(tx1, tx0 + 1u); tx += stepX)
+            [loop] for (uint tx = tx0; tx < max(tx1, tx0 + 1u); ++tx)
             {
-                float3 c = max(gSource.Load(int3(min(tx, fullW - 1u), min(ty, fullH - 1u), 0)).rgb, 0.0);
-                sum += dot(c, kLuma);
-                taken++;
+                const float3 c =
+                    max(gSource.Load(int3(min(tx, fullW - 1u), min(ty, fullH - 1u), 0)).rgb, 0.0);
+                const float luma = dot(c, kLuma);
+
+                sum += isfinite(luma) ? max(luma, 0.0) : 0.0;
+                ++taken;
             }
         }
 
@@ -534,7 +636,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // clipped, so the model is never shown a field of flat white whose blown pixels flip between
         // frames -- unstable input is unstable output, and this is where a bright scene would produce
         // it. The resolve reproduces this exactly, so the two agree on what the frame's own proxy is.
-        float3 display = SoftKnee(frame / max(gWhitePoint, 1e-4));
+        const float compositionWhitePoint = CompositionWhitePoint();
+        float3 display = SoftKnee(frame / compositionWhitePoint);
 
         gTarget[id.xy] = float4(LinearToSrgb(display), source.a);
         return;
@@ -594,7 +697,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // the shadow branch never fires, every pixel takes the highlight branch, and the clamp flattens
     // the result to a near-constant scale. Colour still moves, because that comes from the model's
     // own hue, which is what makes the failure so confusing to look at.
-    const float normScale = gPassthrough != 0 ? 1.0 : max(gWhitePoint, 1e-4);
+    const float normScale = gPassthrough != 0 ? 1.0 : CompositionWhitePoint();
     float3 original = originalSample.rgb / normScale;
 
     float originalLuma = dot(original, kLuma);

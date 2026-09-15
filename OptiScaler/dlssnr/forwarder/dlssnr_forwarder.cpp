@@ -843,6 +843,22 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     return result;
 }
 
+// Standard NGX exposure inputs.
+//
+// Separate optional export so the evaluate ABI does not change. The parameter block
+// persists, therefore null is written too so a generated texture cannot go stale.
+__declspec(dllexport) void dlssnr_call_set_exposure(void *capabilityParams,
+                                                    ID3D12Resource *exposure,
+                                                    float preExposure) {
+    if (!capabilityParams) {
+        return;
+    }
+
+    setResource(capabilityParams, "ExposureTexture", exposure);
+    setFloat(capabilityParams, "DLSS.Pre.Exposure",
+             (preExposure > 1e-6f) ? preExposure : 1.0f);
+}
+
 // Inputs NVIDIA's own Streamline plugin sets that the positional exports predate: the model's global
 // tone strength (read at create), and the interface as the game draws it -- its layer, its alpha, and
 // the composited back buffer -- which is what the model's UI correction was designed around. Called

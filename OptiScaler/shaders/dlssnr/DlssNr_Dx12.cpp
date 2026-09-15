@@ -161,6 +161,7 @@ using PFN_NrEvaluate = int(__cdecl*) (ID3D12GraphicsCommandList*, void*, void*, 
 using PFN_NrRelease = void(__cdecl*) (void*);
 using PFN_NrSetExtras = void(__cdecl*) (void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
                                         unsigned int, unsigned int, unsigned int, unsigned int);
+using PFN_NrSetExposure = void(__cdecl*) (void*, ID3D12Resource*, float);
 using PFN_NrSetFloatSlot = void(__cdecl*) (int);
 using PFN_NrProbeFloat = void(__cdecl*) (void*, const char*, float, int);
 
@@ -173,6 +174,7 @@ struct NrState
     PFN_NrEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
     PFN_NrSetExtras setExtras = nullptr;
+    PFN_NrSetExposure setExposure = nullptr;
     PFN_NrSetFloatSlot setFloatSlot = nullptr;
     PFN_NrProbeFloat probeFloat = nullptr;
     bool floatSlotKnown = false;
@@ -277,6 +279,11 @@ struct NrState
     // raw.
     ID3D12Resource* meter = nullptr;
     ID3D12Resource* meterReadback[4] = {};
+
+    // Same-frame GPU fallback. First channel is the standard NGX exposure value.
+    ID3D12Resource* autoExposure = nullptr;
+    bool autoExposureReadable = false;
+    bool autoExposureAllocationTried = false;
 
     // The calibration grid: what scale the game's buffer is on, measured from the untouched copy.
     // Its own surface and ring rather than sharing the meter's, because the two run at different
@@ -555,6 +562,8 @@ bool EnsureForwarder()
     g_nr.release = (PFN_NrRelease) GetProcAddress(g_nr.forwarder, "dlssnr_call_release");
     // Optional: an older forwarder simply lacks it, and the model runs as before.
     g_nr.setExtras = (PFN_NrSetExtras) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_extras");
+    g_nr.setExposure =
+        (PFN_NrSetExposure) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_exposure");
     g_nr.setFloatSlot = (PFN_NrSetFloatSlot) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_float_slot");
     g_nr.probeFloat = (PFN_NrProbeFloat) GetProcAddress(g_nr.forwarder, "dlssnr_call_probe_float");
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
@@ -2096,6 +2105,21 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_INFO("DLSS-NR: white point meter up, {}x{} tiles", kDlssNrMeterGrid, kDlssNrMeterGrid);
     }
 
+    if (!g_nr.autoExposureAllocationTried)
+    {
+        g_nr.autoExposureAllocationTried = true;
+
+        // R32_FLOAT keeps the reduction precise and is valid as a typed UAV. NGX uses
+        // the first channel of ExposureTexture.
+        g_nr.autoExposure = CreateScratch(device, DXGI_FORMAT_R32_FLOAT, 1, 1);
+        g_nr.autoExposureReadable = false;
+
+        if (g_nr.autoExposure != nullptr)
+            LOG_INFO("DLSS-NR: same-frame GPU auto-exposure fallback is available");
+        else
+            LOG_WARN("DLSS-NR: could not allocate the 1x1 GPU auto-exposure texture");
+    }
+
     // On an engine that needs its compute state put back -- the bindless quirks -- the envelope can
     // only restore what was captured. If nothing was captured for this list, the upscaler decided
     // touching state was unsafe this frame, and binding the pass now would leave state the envelope
@@ -2449,51 +2473,110 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     g_nr.exposureSettingWasOn = exposureSettingOn;
 
-    const bool wantExposure = exposureSettingOn && frame.ExposureTexture != nullptr;
+    auto* gameExposureTexture = (ID3D12Resource*) frame.ExposureTexture;
+    const bool wantGameExposure = exposureSettingOn && gameExposureTexture != nullptr;
 
-    if (g_nr.meter != nullptr && wantExposure)
+    const D3D12_RESOURCE_STATES exposureArrival =
+        cfg.ExposureResourceBarrier.has_value()
+            ? (D3D12_RESOURCE_STATES) cfg.ExposureResourceBarrier.value()
+            : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    // Keep the old CPU-visible game-exposure courier for diagnostics/menu. Composition itself
+    // no longer waits for the readback: when present, the same frame's 1x1 texture is read directly.
+    if (g_nr.meter != nullptr && wantGameExposure)
     {
         DlssNrConstants meterParams {};
         meterParams.Mode = DlssNrMode_Meter;
-
-        // One pixel. Only tile (0,0) is read back, and the tile-mean branch below it in the shader is
-        // dead code the dispatch simply never reaches.
         meterParams.Width = 1;
         meterParams.Height = 1;
-
-        // The game's exposure texture is read here as an SRV. D3D12 has no image layouts, so leaving
-        // it alone costs nothing there; Vulkan does, and a read still requires a shader-readable
-        // layout, so vkd3d-proton faults on what Windows ignores. ExposureResourceBarrier is the key
-        // every upscaler in this tree already honours for this resource
-        // (FSR2Feature_Dx12.cpp:164); unset means it arrives shader-readable and both of these are
-        // no-ops Barrier() skips.
-        auto* exposure = (ID3D12Resource*) frame.ExposureTexture;
-
-        const D3D12_RESOURCE_STATES exposureArrival =
-            cfg.ExposureResourceBarrier.has_value()
-                ? (D3D12_RESOURCE_STATES) cfg.ExposureResourceBarrier.value()
-                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        meterParams.MeterCopiesExposure = 1;
 
         Barrier(cmdList, source, sourceIdle, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cmdList, gameExposureTexture, exposureArrival,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-        if (exposure != nullptr)
-            Barrier(cmdList, exposure, exposureArrival,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        DispatchPass(cmdList, meterParams, source, nullptr, nullptr, gameExposureTexture, nullptr,
+                     g_nr.meter, nullptr);
 
-        DispatchPass(cmdList, meterParams, source, nullptr, nullptr, exposure, nullptr, g_nr.meter, nullptr);
-
-        if (exposure != nullptr)
-            Barrier(cmdList, exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    exposureArrival);
-
+        Barrier(cmdList, gameExposureTexture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                exposureArrival);
         Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
 
         CopyMeterToReadback(cmdList, device, true);
         ConsumeMeterReadback();
     }
 
-    g_nr.gamePreExposure = frame.PreExposure;
+    const float framePreExposure =
+        std::isfinite(frame.PreExposure) && frame.PreExposure > 1e-6f
+            ? frame.PreExposure
+            : 1.0f;
 
+    g_nr.gamePreExposure = framePreExposure;
+
+    // Select one exposure BEFORE Encode. That same 1x1 value is used by Encode, all NR
+    // passes (through NGX), and Resolve. It is never recalculated between Multipass passes.
+    ID3D12Resource* activeExposure = isHdrBuffer ? gameExposureTexture : nullptr;
+    bool activeExposureIsGame = activeExposure != nullptr;
+
+    // The generated value is useful to the composition and may also be consumed by NGX
+    // itself through the standard ExposureTexture parameter.
+    const bool needAutoExposure =
+        isHdrBuffer && activeExposure == nullptr && g_nr.meter != nullptr &&
+        g_nr.autoExposure != nullptr && (exposureSettingOn || g_nr.setExposure != nullptr);
+
+    if (needAutoExposure)
+    {
+        // 1) Original linear HDR -> exact 64x64 tile arithmetic means.
+        DlssNrConstants meterParams {};
+        meterParams.Mode = DlssNrMode_Meter;
+        meterParams.Width = kDlssNrMeterGrid;
+        meterParams.Height = kDlssNrMeterGrid;
+        meterParams.MeterCopiesExposure = 0;
+
+        Barrier(cmdList, source, sourceIdle, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        DispatchPass(cmdList, meterParams, source, nullptr, nullptr, nullptr, nullptr,
+                     g_nr.meter, nullptr);
+        Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
+
+        // 2) 64x64 tile means -> one exposure value.
+        Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (g_nr.autoExposureReadable)
+            Barrier(cmdList, g_nr.autoExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        const D3D12_RESOURCE_DESC exposureSourceDesc = source->GetDesc();
+
+        DlssNrConstants exposureParams {};
+        exposureParams.Mode = DlssNrMode_AutoExposure;
+        exposureParams.Width = 1;
+        exposureParams.Height = 1;
+        exposureParams.PreExposure = framePreExposure;
+        exposureParams.ExposureSourceWidth = (unsigned int) exposureSourceDesc.Width;
+        exposureParams.ExposureSourceHeight = exposureSourceDesc.Height;
+
+        DispatchPass(cmdList, exposureParams, g_nr.meter, nullptr, nullptr, nullptr, nullptr,
+                     g_nr.autoExposure, nullptr);
+
+        Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Barrier(cmdList, g_nr.autoExposure, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        g_nr.autoExposureReadable = true;
+        activeExposure = g_nr.autoExposure;
+        activeExposureIsGame = false;
+    }
+
+    const bool useExposureForComposition =
+        exposureSettingOn && isHdrBuffer && activeExposure != nullptr;
+
+    const float exposureTrim =
+        std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
+
+    // CPU WhitePoint stays the manual / scan fallback. When an exposure resource is active,
+    // Encode and Resolve override this value from t4 on the GPU.
     const float whitePoint = ResolveWhitePoint(cfg, isHdrBuffer);
 
     DlssNrConstants encodeParams {};
@@ -2502,13 +2585,28 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // the resolve adds the model's edit back at full scale.
     encodeParams.Passthrough = isHdrBuffer ? 0u : 1u;
     encodeParams.WhitePoint = whitePoint;
+    encodeParams.PreExposure = framePreExposure;
+    encodeParams.ExposureTrim = exposureTrim;
+    encodeParams.UseExposureTexture = useExposureForComposition ? 1u : 0u;
     // Match only takes effect once a fit exists; until then the table is empty and the shader would
     // read a curve of zeros, so it falls back to the plain proxy.
     encodeParams.Width = width;
     encodeParams.Height = height;
 
     Barrier(cmdList, source, sourceIdle, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    DispatchPass(cmdList, encodeParams, source, nullptr, nullptr, nullptr, nullptr, g_nr.colorCopy, g_nr.hdrCopy);
+
+    if (useExposureForComposition && activeExposureIsGame)
+        Barrier(cmdList, activeExposure, exposureArrival,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // The fifth D3D12 SRV slot is the removed accumulator-history slot; it now carries exposure.
+    DispatchPass(cmdList, encodeParams, source, nullptr, nullptr, nullptr,
+                 useExposureForComposition ? activeExposure : nullptr,
+                 g_nr.colorCopy, g_nr.hdrCopy);
+
+    if (useExposureForComposition && activeExposureIsGame)
+        Barrier(cmdList, activeExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                exposureArrival);
 
     Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
     // The transitions double as the wait for the encode's writes.
@@ -2655,6 +2753,20 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ++passes;
     }
 
+    // Standard NGX exposure for Neural Rendering itself. One value is left in the
+    // capability block for the whole Multipass chain.
+    if (g_nr.setExposure != nullptr)
+        g_nr.setExposure(g_nr.capabilityParams, isHdrBuffer ? activeExposure : nullptr,
+                         framePreExposure);
+
+    const bool modelExposureNeedsBarrier =
+        g_nr.setExposure != nullptr && isHdrBuffer && activeExposureIsGame &&
+        activeExposure != nullptr;
+
+    if (modelExposureNeedsBarrier)
+        Barrier(cmdList, activeExposure, exposureArrival,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
@@ -2710,6 +2822,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
 
+    if (modelExposureNeedsBarrier)
+        Barrier(cmdList, activeExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                exposureArrival);
+
+    // The capability block is shared with the game's own NGX. Do not leave our generated
+    // resource behind after the NR chain.
+    if (g_nr.setExposure != nullptr)
+        g_nr.setExposure(g_nr.capabilityParams, gameExposureTexture, framePreExposure);
+
     g_nr.reset = false;
 
     // Once, a few seconds in, so it lands after the values have been written at least once.
@@ -2761,6 +2882,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         DlssNrConstants resolveParams {};
         resolveParams.Mode = DlssNrMode_Resolve;
         resolveParams.WhitePoint = whitePoint;
+        resolveParams.PreExposure = framePreExposure;
+        resolveParams.ExposureTrim = exposureTrim;
+        resolveParams.UseExposureTexture = useExposureForComposition ? 1u : 0u;
         resolveParams.Width = width;
         resolveParams.Height = height;
         resolveParams.TransferStrength = cfg.DlssNrTransferStrength.value_or_default();
@@ -2840,8 +2964,18 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         }
 
         setWork(answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (useExposureForComposition && activeExposureIsGame)
+            Barrier(cmdList, activeExposure, exposureArrival,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
         DispatchPass(cmdList, resolveParams, modelInput, work[answer], g_nr.hdrCopy, motionIn,
-                            nullptr, target, nullptr);
+                     useExposureForComposition ? activeExposure : nullptr, target, nullptr);
+
+        if (useExposureForComposition && activeExposureIsGame)
+            Barrier(cmdList, activeExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    exposureArrival);
+
         setWork(answer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         g_nr.wroteTarget = true;
@@ -3574,6 +3708,15 @@ void Shutdown()
         g_nr.meter->Release();
         g_nr.meter = nullptr;
     }
+
+    if (g_nr.autoExposure != nullptr)
+    {
+        g_nr.autoExposure->Release();
+        g_nr.autoExposure = nullptr;
+    }
+
+    g_nr.autoExposureReadable = false;
+    g_nr.autoExposureAllocationTried = false;
 
     if (g_nr.calib != nullptr)
     {

@@ -41,9 +41,9 @@
 //
 // A fifth dispatch has since been added -- the calibration grid -- which at thirty-two slots would
 // have left six frames, spending exactly the headroom the previous note set aside. Forty-eight
-// restores eight frames at five dispatches. If a sixth is ever added, raise this with it rather than
-// spending the margin again.
-#define DLSSNR_NUM_OF_HEAPS 48
+// restores eight frames at five dispatches. Auto exposure adds a sixth dispatch on fallback frames,
+// so keep the safety margin instead of consuming it.
+#define DLSSNR_NUM_OF_HEAPS 64
 
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 {
