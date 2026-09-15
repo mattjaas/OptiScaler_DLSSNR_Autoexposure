@@ -82,7 +82,7 @@ jobs:
             $text = [System.IO.File]::ReadAllText($Path)
             $count = ([regex]::Matches($text, [regex]::Escape($Old))).Count
             if ($count -ne $Expected) {
-              Write-Error "$Label: expected $Expected match(es), found $count in $Path"
+              Write-Error ("{0}: expected {1} match(es), found {2} in {3}" -f $Label, $Expected, $count, $Path)
               exit 1
             }
             $text = $text.Replace($Old, $New)
