@@ -285,6 +285,16 @@ struct NrState
     bool autoExposureReadable = false;
     bool autoExposureAllocationTried = false;
 
+    // Delayed CPU-visible diagnostics only. Rendering continues to use the same-frame GPU value.
+    float meterPreExposure[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    unsigned int meterSourceWidth[4] = {};
+    unsigned int meterSourceHeight[4] = {};
+    float autoExposureValue = 0.0f;
+    float autoExposurePreExposure = 1.0f;
+    float autoExposureAverageLuma = 0.0f;
+    float autoExposureWhitePoint = 0.0f;
+    bool autoExposureStatsValid = false;
+
     // The calibration grid: what scale the game's buffer is on, measured from the untouched copy.
     // Its own surface and ring rather than sharing the meter's, because the two run at different
     // sizes -- the meter fetches one texel and this reads the whole frame.
@@ -940,7 +950,8 @@ void CopyCalibrationToReadback(ID3D12GraphicsCommandList* cmdList)
 }
 
 void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device,
-                         bool exposureBound)
+                         bool exposureBound, float preExposure,
+                         unsigned int sourceWidth, unsigned int sourceHeight)
 {
     const unsigned int slot = (unsigned int) (g_nr.meterFrames % 4);
 
@@ -949,6 +960,10 @@ void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* devic
 
     // Travels with the grid: read back three frames from now, alongside the tiles it describes.
     g_nr.meterExposureValid[slot] = exposureBound;
+    g_nr.meterPreExposure[slot] =
+        std::isfinite(preExposure) && preExposure > 1e-6f ? preExposure : 1.0f;
+    g_nr.meterSourceWidth[slot] = sourceWidth;
+    g_nr.meterSourceHeight[slot] = sourceHeight;
 
     D3D12_TEXTURE_COPY_LOCATION src {};
     src.pResource = g_nr.meter;
@@ -1092,22 +1107,85 @@ void ConsumeMeterReadback()
         return;
 
     void* mapped = nullptr;
-    D3D12_RANGE range { 0, sizeof(float) };
+    D3D12_RANGE range { 0, kMeterBytes };
 
     if (FAILED(buffer->Map(0, &range, &mapped)) || mapped == nullptr)
         return;
 
-    const float* src = (const float*) mapped;
+    const float* values = (const float*) mapped;
+    const bool carriesGameExposure = g_nr.meterExposureValid[slot];
 
-    // Only believed when the frame that wrote this grid actually had an exposure texture bound. With
-    // nothing bound DispatchPass substitutes the source picture, and tile 0 is then a scene pixel
-    // rather than an exposure -- believing it made the white point follow the top-left corner of the
-    // screen, which in Cyberpunk moved by up to 272x between frames and flashed the whole picture.
-    //
-    // When it is not believed gameExposure keeps its last good value, or stays 0 and lets
-    // ResolveWhitePoint fall back to the slider, which is what a game supplying none should get.
-    if (g_nr.meterExposureValid[slot] && std::isfinite(src[0]) && src[0] > 0.0f)
-        g_nr.gameExposure = src[0];
+    if (carriesGameExposure && std::isfinite(values[0]) && values[0] > 0.0f)
+    {
+        g_nr.gameExposure = values[0];
+        g_nr.gamePreExposure = g_nr.meterPreExposure[slot];
+    }
+    else if (!carriesGameExposure)
+    {
+        const unsigned int sourceWidth = std::max(g_nr.meterSourceWidth[slot], 1u);
+        const unsigned int sourceHeight = std::max(g_nr.meterSourceHeight[slot], 1u);
+
+        double weightedLuma = 0.0;
+        double totalPixels = 0.0;
+
+        // Match mode 5 on the GPU: every 64x64 tile mean is weighted by the exact number
+        // of source pixels represented by that tile. This makes the displayed diagnostic
+        // AverageLuma correspond to the actual exposure formula used for rendering, only delayed.
+        for (unsigned int ty = 0; ty < kDlssNrMeterGrid; ++ty)
+        {
+            const unsigned int y0 = (ty * sourceHeight) / kDlssNrMeterGrid;
+            const unsigned int y1 = ((ty + 1) * sourceHeight) / kDlssNrMeterGrid;
+            const unsigned int tileH = y1 > y0 ? y1 - y0 : 0;
+
+            for (unsigned int tx = 0; tx < kDlssNrMeterGrid; ++tx)
+            {
+                const unsigned int x0 = (tx * sourceWidth) / kDlssNrMeterGrid;
+                const unsigned int x1 = ((tx + 1) * sourceWidth) / kDlssNrMeterGrid;
+                const unsigned int tileW = x1 > x0 ? x1 - x0 : 0;
+
+                if (tileW == 0 || tileH == 0)
+                    continue;
+
+                const float tileMean = values[ty * kDlssNrMeterGrid + tx];
+
+                if (!std::isfinite(tileMean) || tileMean < 0.0f)
+                    continue;
+
+                const double pixels = (double) tileW * (double) tileH;
+                weightedLuma += (double) tileMean * pixels;
+                totalPixels += pixels;
+            }
+        }
+
+        const float preExposure =
+            std::isfinite(g_nr.meterPreExposure[slot]) && g_nr.meterPreExposure[slot] > 1e-6f
+                ? g_nr.meterPreExposure[slot]
+                : 1.0f;
+
+        if (totalPixels > 0.0)
+        {
+            const float averageBufferLuma = (float) (weightedLuma / totalPixels);
+            const float averageSceneLuma = averageBufferLuma / preExposure;
+
+            if (std::isfinite(averageSceneLuma) && averageSceneLuma > 1e-8f)
+            {
+                const float exposure = 0.18f / std::max(averageSceneLuma * 0.82f, 1e-8f);
+
+                if (std::isfinite(exposure) && exposure > 1e-8f)
+                {
+                    const float trim = std::clamp(
+                        Config::Instance()->DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
+
+                    g_nr.autoExposureAverageLuma = averageSceneLuma;
+                    g_nr.autoExposureValue = exposure;
+                    g_nr.autoExposurePreExposure = preExposure;
+                    g_nr.autoExposureWhitePoint = std::clamp(
+                        (preExposure / exposure) * trim, 0.01f, 4096.0f);
+                    g_nr.autoExposureStatsValid = true;
+                }
+            }
+        }
+    }
 
     D3D12_RANGE nothingWritten { 0, 0 };
     buffer->Unmap(0, &nothingWritten);
@@ -1133,9 +1211,20 @@ void ConsumeMeterReadback()
 void InvalidateExposureMeter()
 {
     g_nr.gameExposure = 0.0f;
+    g_nr.gamePreExposure = 1.0f;
+    g_nr.autoExposureValue = 0.0f;
+    g_nr.autoExposurePreExposure = 1.0f;
+    g_nr.autoExposureAverageLuma = 0.0f;
+    g_nr.autoExposureWhitePoint = 0.0f;
+    g_nr.autoExposureStatsValid = false;
 
-    for (bool& valid : g_nr.meterExposureValid)
-        valid = false;
+    for (unsigned int i = 0; i < 4; ++i)
+    {
+        g_nr.meterExposureValid[i] = false;
+        g_nr.meterPreExposure[i] = 1.0f;
+        g_nr.meterSourceWidth[i] = 0;
+        g_nr.meterSourceHeight[i] = 0;
+    }
 
     // Re-arms the `< 4` guard in ConsumeMeterReadback, so nothing is read back until four frames
     // have genuinely been queued since this point.
@@ -2502,7 +2591,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 exposureArrival);
         Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
 
-        CopyMeterToReadback(cmdList, device, true);
+        const D3D12_RESOURCE_DESC gameExposureSourceDesc = source->GetDesc();
+        CopyMeterToReadback(
+            cmdList, device, true,
+            std::isfinite(frame.PreExposure) && frame.PreExposure > 1e-6f ? frame.PreExposure : 1.0f,
+            (unsigned int) gameExposureSourceDesc.Width, gameExposureSourceDesc.Height);
         ConsumeMeterReadback();
     }
 
@@ -2537,6 +2630,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         DispatchPass(cmdList, meterParams, source, nullptr, nullptr, nullptr, nullptr,
                      g_nr.meter, nullptr);
         Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
+
+        const D3D12_RESOURCE_DESC autoExposureSourceDesc = source->GetDesc();
+        CopyMeterToReadback(cmdList, device, false, framePreExposure,
+                            (unsigned int) autoExposureSourceDesc.Width,
+                            autoExposureSourceDesc.Height);
+        ConsumeMeterReadback();
 
         // 2) 64x64 tile means -> one exposure value.
         Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -2578,6 +2677,51 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // CPU WhitePoint stays the manual / scan fallback. When an exposure resource is active,
     // Encode and Resolve override this value from t4 on the GPU.
     const float whitePoint = ResolveWhitePoint(cfg, isHdrBuffer);
+
+    if (isHdrBuffer)
+    {
+        enum class ExposureSource : unsigned int { None, Game, Auto };
+        const ExposureSource sourceNow =
+            activeExposure != nullptr
+                ? (activeExposureIsGame ? ExposureSource::Game : ExposureSource::Auto)
+                : ExposureSource::None;
+
+        static ExposureSource lastSource = ExposureSource::None;
+        static unsigned long long lastAutoDiagFrame = 0;
+
+        const bool periodicAutoDiagnostic =
+            sourceNow == ExposureSource::Auto && g_nr.autoExposureStatsValid &&
+            g_nr.meterFrames >= lastAutoDiagFrame + 120ull;
+
+        if (sourceNow != lastSource || periodicAutoDiagnostic)
+        {
+            lastSource = sourceNow;
+
+            if (sourceNow == ExposureSource::Game)
+            {
+                LOG_INFO("DLSS-NR exposure source: GAME (game ExposureTexture active)");
+            }
+            else if (sourceNow == ExposureSource::Auto)
+            {
+                if (g_nr.autoExposureStatsValid)
+                {
+                    LOG_INFO(
+                        "DLSS-NR exposure source: AUTO FALLBACK ACTIVE | AverageLuma {:.6f} | Exposure {:.6f} | PreExposure {:.6f} | effective WhitePoint {:.6f} | diagnostics delayed 4 frames",
+                        g_nr.autoExposureAverageLuma, g_nr.autoExposureValue,
+                        g_nr.autoExposurePreExposure, g_nr.autoExposureWhitePoint);
+                    lastAutoDiagFrame = g_nr.meterFrames;
+                }
+                else
+                {
+                    LOG_INFO("DLSS-NR exposure source: AUTO FALLBACK ACTIVE | diagnostic readback warming up");
+                }
+            }
+            else if (exposureSettingOn)
+            {
+                LOG_INFO("DLSS-NR exposure source: NONE | manual/scan fallback");
+            }
+        }
+    }
 
     DlssNrConstants encodeParams {};
     encodeParams.Mode = DlssNrMode_Encode;
