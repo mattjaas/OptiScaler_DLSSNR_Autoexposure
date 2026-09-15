@@ -449,6 +449,13 @@ using PFN_NrSetFloatSlot = void(__cdecl*) (int);
     ID3D12Resource* autoExposure = nullptr;
     bool autoExposureReadable = false;
     bool autoExposureAllocationTried = false;
+
+    // CPU-side diagnostics from delayed meter readback. These values are NOT used for rendering.
+    float meterPreExposure[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    float autoExposureValue = 0.0f;
+    float autoExposurePreExposure = 1.0f;
+    float autoExposureAverageLuma = 0.0f;
+    bool autoExposureStatsValid = false;
 ''',
         "NrState auto exposure resource",
     )
@@ -493,6 +500,142 @@ using PFN_NrSetFloatSlot = void(__cdecl*) (int);
     // On an engine that needs its compute state put back'''
     s = replace_once(s, allocation_anchor, allocation_replacement, "auto exposure allocation")
 
+
+    s = replace_once(
+        s,
+        '''void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device,
+                          bool exposureBound)
+{
+    const unsigned int slot = (unsigned int) (g_nr.meterFrames % 4);
+    if (g_nr.meterReadback[slot] == nullptr)
+        return;
+
+    // Travels with the grid: read back three frames from now, alongside the tiles it describes.
+    g_nr.meterExposureValid[slot] = exposureBound;
+''',
+        '''void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* device,
+                          bool exposureBound, float preExposure)
+{
+    const unsigned int slot = (unsigned int) (g_nr.meterFrames % 4);
+    if (g_nr.meterReadback[slot] == nullptr)
+        return;
+
+    // Travels with the grid: read back three frames from now, alongside the tiles it describes.
+    g_nr.meterExposureValid[slot] = exposureBound;
+    g_nr.meterPreExposure[slot] =
+        std::isfinite(preExposure) && preExposure > 1e-6f ? preExposure : 1.0f;
+''',
+        "CopyMeterToReadback signature",
+    )
+
+    s = regex_once(
+        s,
+        r"void ConsumeMeterReadback\(\)\n\{.*?\n\}\n// Forget everything the meter knows,",
+        r'''void ConsumeMeterReadback()
+{
+    if (g_nr.meterFrames < 4)
+        return;
+
+    const unsigned int slot = (unsigned int) (g_nr.meterFrames % 4);
+    ID3D12Resource* buffer = g_nr.meterReadback[slot];
+
+    if (buffer == nullptr)
+        return;
+
+    void* mapped = nullptr;
+    D3D12_RANGE range { 0, kMeterBytes };
+
+    if (FAILED(buffer->Map(0, &range, &mapped)) || mapped == nullptr)
+        return;
+
+    const float* src = (const float*) mapped;
+    const bool gameExposureValid =
+        g_nr.meterExposureValid[slot] && std::isfinite(src[0]) && src[0] > 0.0f;
+
+    if (gameExposureValid)
+    {
+        g_nr.gameExposure = src[0];
+        g_nr.gamePreExposure = g_nr.meterPreExposure[slot];
+    }
+
+    // Tile 0 may carry the game's 1x1 exposure courier. The remaining tiles are mean BT.709
+    // luminances of the ORIGINAL HDR input. These delayed CPU diagnostics do not drive rendering;
+    // they only let the menu/log confirm that AUTO fallback is active and changing.
+    double sum = 0.0;
+    unsigned int samples = 0;
+
+    for (unsigned int i = 1; i < kDlssNrMeterGrid * kDlssNrMeterGrid; ++i)
+    {
+        const float v = src[i];
+
+        if (std::isfinite(v) && v >= 0.0f)
+        {
+            sum += (double) v;
+            ++samples;
+        }
+    }
+
+    if (samples >= (kDlssNrMeterGrid * kDlssNrMeterGrid) / 2)
+    {
+        const float averageBufferLuma = (float) (sum / (double) samples);
+        const float preExposure =
+            std::isfinite(g_nr.meterPreExposure[slot]) && g_nr.meterPreExposure[slot] > 1e-6f
+                ? g_nr.meterPreExposure[slot]
+                : 1.0f;
+
+        const float averageSceneLuma = averageBufferLuma / preExposure;
+
+        if (std::isfinite(averageSceneLuma) && averageSceneLuma > 1e-8f)
+        {
+            const float exposure = 0.18f / std::max(averageSceneLuma * 0.82f, 1e-8f);
+
+            if (std::isfinite(exposure) && exposure > 1e-8f)
+            {
+                g_nr.autoExposureAverageLuma = averageSceneLuma;
+                g_nr.autoExposureValue = exposure;
+                g_nr.autoExposurePreExposure = preExposure;
+                g_nr.autoExposureStatsValid = true;
+            }
+        }
+    }
+
+    D3D12_RANGE nothingWritten { 0, 0 };
+    buffer->Unmap(0, &nothingWritten);
+}
+// Forget everything the meter knows,''',
+        "ConsumeMeterReadback diagnostics",
+    )
+
+    s = replace_once(
+        s,
+        '''void InvalidateExposureMeter()
+{
+    g_nr.gameExposure = 0.0f;
+    for (bool& valid : g_nr.meterExposureValid)
+        valid = false;
+
+    // Re-arms the `< 4` guard in ConsumeMeterReadback, so nothing is read back until four frames
+''',
+        '''void InvalidateExposureMeter()
+{
+    g_nr.gameExposure = 0.0f;
+    g_nr.gamePreExposure = 1.0f;
+    g_nr.autoExposureValue = 0.0f;
+    g_nr.autoExposurePreExposure = 1.0f;
+    g_nr.autoExposureAverageLuma = 0.0f;
+    g_nr.autoExposureStatsValid = false;
+
+    for (unsigned int i = 0; i < 4; ++i)
+    {
+        g_nr.meterExposureValid[i] = false;
+        g_nr.meterPreExposure[i] = 1.0f;
+    }
+
+    // Re-arms the `< 4` guard in ConsumeMeterReadback, so nothing is read back until four frames
+''',
+        "InvalidateExposureMeter diagnostics",
+    )
+
     pattern = (
         r'    const bool wantExposure = exposureSettingOn && frame\.ExposureTexture != nullptr;\n'
         r'.*?'
@@ -529,7 +672,8 @@ using PFN_NrSetFloatSlot = void(__cdecl*) (int);
                 exposureArrival);
         Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
 
-        CopyMeterToReadback(cmdList, device, true);
+        CopyMeterToReadback(cmdList, device, true,
+            std::isfinite(frame.PreExposure) && frame.PreExposure > 1e-6f ? frame.PreExposure : 1.0f);
         ConsumeMeterReadback();
     }
 
@@ -564,6 +708,10 @@ using PFN_NrSetFloatSlot = void(__cdecl*) (int);
         DispatchPass(cmdList, meterParams, source, nullptr, nullptr, nullptr, nullptr,
                      g_nr.meter, nullptr);
         Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
+
+        // Delayed CPU diagnostics only. The rendering path uses the same-frame GPU result below.
+        CopyMeterToReadback(cmdList, device, false, framePreExposure);
+        ConsumeMeterReadback();
 
         // 2) 64x64 tile means -> one exposure value.
         Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -605,6 +753,54 @@ using PFN_NrSetFloatSlot = void(__cdecl*) (int);
     // CPU WhitePoint stays the manual / scan fallback. When an exposure resource is active,
     // Encode and Resolve override this value from t4 on the GPU.
     const float whitePoint = ResolveWhitePoint(cfg, isHdrBuffer);
+
+    if (isHdrBuffer)
+    {
+        enum class ExposureSource : unsigned int { None, Game, Auto };
+        const ExposureSource sourceNow =
+            activeExposure != nullptr
+                ? (activeExposureIsGame ? ExposureSource::Game : ExposureSource::Auto)
+                : ExposureSource::None;
+
+        static ExposureSource lastSource = ExposureSource::None;
+        static unsigned long long lastAutoDiagLog = 0;
+
+        const bool periodicAutoLog =
+            sourceNow == ExposureSource::Auto && g_nr.autoExposureStatsValid &&
+            (g_nr.meterFrames >= lastAutoDiagLog + 120ull);
+
+        if (sourceNow != lastSource || periodicAutoLog)
+        {
+            lastSource = sourceNow;
+
+            if (sourceNow == ExposureSource::Game)
+            {
+                LOG_INFO("DLSS-NR exposure source: GAME (game ExposureTexture is active this frame)");
+            }
+            else if (sourceNow == ExposureSource::Auto)
+            {
+                if (g_nr.autoExposureStatsValid)
+                {
+                    const float diagWhitePoint = std::clamp(
+                        (g_nr.autoExposurePreExposure / g_nr.autoExposureValue) * exposureTrim,
+                        0.01f, 4096.0f);
+                    LOG_INFO(
+                        "DLSS-NR exposure source: AUTO FALLBACK ACTIVE (diag delayed by meter readback; avgLuma {:.6f}, exposure {:.6f}, preExposure {:.6f}, whitePoint {:.6f}, trim {:.3f})",
+                        g_nr.autoExposureAverageLuma, g_nr.autoExposureValue,
+                        g_nr.autoExposurePreExposure, diagWhitePoint, exposureTrim);
+                    lastAutoDiagLog = g_nr.meterFrames;
+                }
+                else
+                {
+                    LOG_INFO("DLSS-NR exposure source: AUTO FALLBACK ACTIVE (warming up; diagnostic readback pending)");
+                }
+            }
+            else if (exposureSettingOn)
+            {
+                LOG_INFO("DLSS-NR exposure source: NONE (manual / scan fallback)");
+            }
+        }
+    }
 '''
 
     s = regex_once(s, pattern, replacement, "game/auto exposure block")
