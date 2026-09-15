@@ -8,11 +8,14 @@ ROOT = next((p for p in _candidates if (p / "OptiScaler").is_dir()), None)
 if ROOT is None:
     raise RuntimeError("Run this script from the repository root (the directory containing OptiScaler).")
 
+
 def read(rel):
     return (ROOT / rel).read_text(encoding="utf-8-sig")
 
+
 def write(rel, text):
     (ROOT / rel).write_text(text, encoding="utf-8", newline="\n")
+
 
 def replace_once(text, old, new, label):
     count = text.count(old)
@@ -20,7 +23,14 @@ def replace_once(text, old, new, label):
         raise RuntimeError(f"{label}: expected exactly one match, got {count}")
     return text.replace(old, new, 1)
 
-# 0) Config + UI: Automatic Exposure is a separate WhitePointSource.
+
+# -----------------------------------------------------------------------------
+# Config + menu: four independent white-point sources.
+#   0 Paper white only
+#   1 The game's own exposure (game only; no fallback)
+#   2 Automatic exposure (always our GPU calculation)
+#   3 A buffer the scan found (manual scan/anchors)
+# -----------------------------------------------------------------------------
 rel = "OptiScaler/Config.h"
 s = read(rel)
 s = replace_once(
@@ -109,7 +119,7 @@ s = replace_once(
                            "\nfrom the original linear-HDR frame before Neural Rendering. The game's"
                            "\nExposureTexture is ignored even when the game provides one."
                            "\n\nA buffer the scan found -- the existing manually calibrated scan path."
-                           "\nIt is now the fourth source.");''',
+                           "\nIt is the fourth source and owns the meter/anchor controls below.");''',
     "menu source help",
 )
 s = replace_once(
@@ -135,7 +145,7 @@ s = replace_once(
     s,
     "        if (wpSource == 2)\n",
     "        if (wpSource == 3)\n",
-    "menu scan controls shift to source 3",
+    "menu scan paper-white controls shift to source 3",
 )
 s = replace_once(
     s,
@@ -215,9 +225,9 @@ new = r'''        else if (wpSource == 1)
         {
             float autoTrim = config->DlssNrAutoExposureTrim.value_or_default();
 
-            if (ImGui::SliderFloat("Trim (x automatic exposure)", &autoTrim, 0.25f, 4.0f, "%.2fx",
+            if (ImGui::SliderFloat("Trim (x automatic exposure)", &autoTrim, 0.25f, 10.0f, "%.2fx",
                                    ImGuiSliderFlags_Logarithmic))
-                config->DlssNrAutoExposureTrim = std::clamp(autoTrim, 0.25f, 4.0f);
+                config->DlssNrAutoExposureTrim = std::clamp(autoTrim, 0.25f, 10.0f);
 
             ImGui::SameLine();
             if (ImGui::SmallButton("Reset##autoexposuretrim"))
@@ -228,14 +238,42 @@ new = r'''        else if (wpSource == 1)
                        "\n\nThis source always uses OptiScaler's calculation: the game's ExposureTexture"
                        "\nis ignored even when present. One 1x1 exposure value is calculated on the GPU"
                        "\nand reused by Encode, every Neural Rendering pass, and Resolve."
-                       "\n\n1.00x uses the calculated value unchanged. Range: 0.25x to 4.00x."
+                       "\n\n1.00x uses the calculated value unchanged. Range: 0.25x to 10.00x."
                        "\nAutomatic exposure is currently D3D12 only.");
         }
 '''
 s = replace_once(s, old, new, "menu separate game/automatic exposure controls")
+
+s = replace_once(
+    s,
+    "        {\n            // No checkbox here any more.\n",
+    "        if (wpSource == 3)\n        {\n            // No checkbox here any more.\n",
+    "scan UI source guard",
+)
+s = replace_once(
+    s,
+    "if (config->DlssNrWhitePointSource.value_or_default() == 2 &&\n",
+    "if (config->DlssNrWhitePointSource.value_or_default() == 3 &&\n",
+    "scan meter source index",
+)
+s = replace_once(
+    s,
+    "const bool isSource = config->DlssNrWhitePointSource.value_or_default() == 2;\n",
+    "const bool isSource = config->DlssNrWhitePointSource.value_or_default() == 3;\n",
+    "scan anchor source index",
+)
 write(rel, s)
 
-# 1) Shared constants/modes.
+rel = "OptiScaler/dlssnr/DlssNr_ExposureScan.cpp"
+s = read(rel)
+s = replace_once(
+    s,
+    "DlssNrWhitePointSource.value_or_default() == 2 ||",
+    "DlssNrWhitePointSource.value_or_default() == 3 ||",
+    "scan runtime source index",
+)
+write(rel, s)
+
 rel = "OptiScaler/shaders/dlssnr/DlssNr_Common.h"
 s = read(rel)
 s = replace_once(
@@ -263,7 +301,6 @@ s = replace_once(
 )
 write(rel, s)
 
-# 2) D3D composition shader.
 rel = "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
 s = read(rel)
 s = replace_once(
@@ -284,10 +321,8 @@ s = replace_once(
 )
 
 anchor = "    if (gMode == 4)\n"
-auto_mode = r'''    // NVIDIA DLSS auto-exposure fallback. gSource is the 64x64 grid of exact tile
+auto_mode = r'''    // NVIDIA DLSS automatic exposure. gSource is the 64x64 grid of exact tile
     // means produced by mode 3 from the ORIGINAL linear-HDR frame, before NR touches it.
-    // Weighting by the source tile areas makes this the arithmetic mean of all source pixels even
-    // when width/height are not divisible by 64.
     if (gMode == 5)
     {
         if (id.x != 0 || id.y != 0)
@@ -295,7 +330,6 @@ auto_mode = r'''    // NVIDIA DLSS auto-exposure fallback. gSource is the 64x64 
 
         const uint srcW = max(gExposureSourceWidth, 1u);
         const uint srcH = max(gExposureSourceHeight, 1u);
-
         float weightedLuma = 0.0;
         float totalPixels = 0.0;
 
@@ -312,20 +346,15 @@ auto_mode = r'''    // NVIDIA DLSS auto-exposure fallback. gSource is the 64x64 
                 const uint tileW = max(x1 - x0, 1u);
                 const float pixels = (float) tileW * (float) tileH;
                 const float tileMean = max(SanitizeFinite(gSource.Load(int3(tx, ty, 0)).r, 0.0), 0.0);
-
                 weightedLuma += tileMean * pixels;
                 totalPixels += pixels;
             }
         }
 
-        const float averageBufferLuma =
-            totalPixels > 0.0 ? weightedLuma / totalPixels : 0.0;
+        const float averageBufferLuma = totalPixels > 0.0 ? weightedLuma / totalPixels : 0.0;
         const float preExposure =
             (isfinite(gPreExposure) && gPreExposure > 1e-6) ? gPreExposure : 1.0;
         const float averageSceneLuma = averageBufferLuma / preExposure;
-
-        // DLSS Programming Guide:
-        // ExposureValue = MidGray / (AverageLuma * (1 - MidGray)), MidGray = 0.18.
         float exposure = averageSceneLuma > 1e-8
             ? 0.18 / (averageSceneLuma * 0.82)
             : 1.0;
@@ -360,8 +389,6 @@ old_meter_head = r'''    if (gMode == 3)
 '''
 new_meter_head = r'''    if (gMode == 3)
     {
-        // Existing white-point path: copy the game's own 1x1 exposure into tile (0,0).
-        // Auto exposure sets this flag to zero and uses the same mode for a real luminance grid.
         if (gMeterCopiesExposure != 0)
         {
             if (id.x == 0 && id.y == 0)
@@ -393,9 +420,8 @@ old_sampling = r'''        // A tile of a 4K frame is 60x34 pixels. Sampling a b
 
         gTarget[id.xy] = float4(taken > 0u ? sum / (float) taken : 0.0, 0.0, 0.0, 1.0);
 '''
-new_sampling = r'''        // Exact arithmetic mean for this tile. The second pass weights these means by the exact
-        // tile areas, so the final value is AverageLuma over the whole source frame, not a sample or
-        // percentile approximation.
+new_sampling = r'''        // Exact arithmetic mean for this tile. The reduction below weights the means by
+        // exact tile area, giving the arithmetic mean of the whole source frame.
         float sum = 0.0;
         uint taken = 0;
 
@@ -415,22 +441,16 @@ new_sampling = r'''        // Exact arithmetic mean for this tile. The second pa
 s = replace_once(s, old_sampling, new_sampling, "meter exact mean")
 write(rel, s)
 
-# 3) Forwarder: optional setter instead of changing the evaluate ABI.
 rel = "OptiScaler/dlssnr/forwarder/dlssnr_forwarder.cpp"
 s = read(rel)
 marker = '''// Inputs NVIDIA's own Streamline plugin sets that the positional exports predate: the model's global
 '''
-setter = r'''// Standard NGX exposure input. Kept as a separate optional export so an older forwarder remains
-// binary-compatible with the host; the host simply cannot provide exposure through it.
+setter = r'''// Standard NGX exposure input. Separate optional export keeps the positional evaluate ABI intact.
 __declspec(dllexport) void dlssnr_call_set_exposure(void *capabilityParams,
                                                     ID3D12Resource *exposure) {
     if (!capabilityParams) {
         return;
     }
-
-    // NVIDIA's public NGX name is NVSDK_NGX_Parameter_ExposureTexture == "ExposureTexture".
-    // Write null as well: capabilityParams is shared with the game's DLSS and outlives a frame, so a
-    // missing exposure must clear the previous pointer rather than leave a stale resource behind.
     setResource(capabilityParams, "ExposureTexture", exposure);
 }
 
@@ -438,10 +458,8 @@ __declspec(dllexport) void dlssnr_call_set_exposure(void *capabilityParams,
 s = replace_once(s, marker, setter + marker, "forwarder exposure setter")
 write(rel, s)
 
-# 4) D3D12 host.
 rel = "OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp"
 s = read(rel)
-
 s = replace_once(
     s,
     "using PFN_NrSetExtras = void(__cdecl*) (void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,\n"
@@ -453,7 +471,6 @@ s = replace_once(
     "using PFN_NrSetFloatSlot = void(__cdecl*) (int);\n",
     "PFN exposure typedef",
 )
-
 s = replace_once(
     s,
     "    PFN_NrSetExtras setExtras = nullptr;\n"
@@ -463,7 +480,6 @@ s = replace_once(
     "    PFN_NrSetFloatSlot setFloatSlot = nullptr;\n",
     "state setter pointer",
 )
-
 s = replace_once(
     s,
     "    ID3D12Resource* meter = nullptr;\n"
@@ -471,13 +487,10 @@ s = replace_once(
     "    ID3D12Resource* meter = nullptr;\n"
     "    ID3D12Resource* meterReadback[4] = {};\n"
     "\n"
-    "    // GPU-generated fallback for games that do not supply NGX ExposureTexture. R32_FLOAT is used\n"
-    "    // because this pass already has a proven typed-UAV path for it; NGX reads the first channel.\n"
     "    ID3D12Resource* autoExposure = nullptr;\n"
     "    bool autoExposureReadable = false;\n",
     "auto exposure state",
 )
-
 s = replace_once(
     s,
     "    g_nr.setExtras = (PFN_NrSetExtras) GetProcAddress(g_nr.forwarder, \"dlssnr_call_set_extras\");\n"
@@ -488,7 +501,6 @@ s = replace_once(
     "    g_nr.setFloatSlot = (PFN_NrSetFloatSlot) GetProcAddress(g_nr.forwarder, \"dlssnr_call_set_float_slot\");\n",
     "resolve exposure export",
 )
-
 needle = '''        if (g_nr.meter != nullptr)
             LOG_INFO("DLSS-NR: white point meter up, {}x{} tiles", kDlssNrMeterGrid, kDlssNrMeterGrid);
     }
@@ -506,12 +518,11 @@ replacement = '''        if (g_nr.meter != nullptr)
         if (g_nr.autoExposure == nullptr)
             LOG_WARN("DLSS-NR: could not allocate the 1x1 auto-exposure texture");
         else
-            LOG_INFO("DLSS-NR: GPU auto-exposure fallback is available");
+            LOG_INFO("DLSS-NR: GPU auto exposure is available");
     }
 
     // On an engine that needs its compute state put back'''
 s = replace_once(s, needle, replacement, "auto exposure allocation")
-
 s = replace_once(
     s,
     "        meterParams.Width = 1;\n"
@@ -525,17 +536,12 @@ s = replace_once(
     "        // The game's exposure texture is read here as an SRV.",
     "meter copy flag",
 )
-
 needle = '''    g_nr.gamePreExposure = frame.PreExposure;
 
     const float whitePoint = ResolveWhitePoint(cfg, isHdrBuffer);
 '''
 replacement = '''    g_nr.gamePreExposure = frame.PreExposure;
 
-    // What Neural Rendering receives as NGX ExposureTexture. Prefer the game's own value. If it did
-    // not supply one, calculate the documented DLSS exposure entirely on the GPU from the original
-    // linear-HDR input, before encode/NR can alter it. One value is produced here and reused by every
-    // feature in the multi-pass chain below.
     ID3D12Resource* nrExposure = (ID3D12Resource*) frame.ExposureTexture;
     const bool nrExposureIsGame = nrExposure != nullptr;
     const D3D12_RESOURCE_STATES exposureArrival =
@@ -556,8 +562,6 @@ replacement = '''    g_nr.gamePreExposure = frame.PreExposure;
         DispatchPass(cmdList, meterParams, source, nullptr, nullptr, nullptr, nullptr, g_nr.meter, nullptr);
         Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
 
-        // The meter's UAV -> SRV transition is both the state change and the ordering point between
-        // the tile pass and the 1x1 reduction.
         Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -585,15 +589,12 @@ replacement = '''    g_nr.gamePreExposure = frame.PreExposure;
         nrExposure = g_nr.autoExposure;
     }
 
-    // Optional export: old forwarders continue to work unchanged; a new one writes the standard NGX
-    // "ExposureTexture" key. Writing null is important because capabilityParams persists across frames.
     if (g_nr.setExposure != nullptr)
         g_nr.setExposure(g_nr.capabilityParams, nrExposure);
 
     const float whitePoint = ResolveWhitePoint(cfg, isHdrBuffer);
 '''
 s = replace_once(s, needle, replacement, "auto exposure dispatch")
-
 needle = '''    if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
@@ -609,7 +610,6 @@ replacement = '''    if (g_nr.setExposure != nullptr && nrExposureIsGame)
     int result = NVSDK_NGX_Result_Success;
 '''
 s = replace_once(s, needle, replacement, "game exposure transition")
-
 needle = '''    if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
 
@@ -625,7 +625,6 @@ replacement = '''    if (g_ngxTime != nullptr)
     g_nr.reset = false;
 '''
 s = replace_once(s, needle, replacement, "game exposure restore")
-
 needle = '''    if (g_nr.meter != nullptr)
     {
         g_nr.meter->Release();
@@ -653,12 +652,6 @@ replacement = '''    if (g_nr.meter != nullptr)
 s = replace_once(s, needle, replacement, "auto exposure shutdown")
 write(rel, s)
 
-print("DLSS-NR auto-exposure source patch applied")
-
-# 5) V4 refinements: Automatic Exposure is an independent source and always uses our GPU calculation.
-# Game Exposure is game-only. The generated 1x1 texture drives composition without CPU readback.
-
-# Extend the shared constant tail. Existing offsets stay unchanged because these fields are appended.
 rel = "OptiScaler/shaders/dlssnr/DlssNr_Common.h"
 s = read(rel)
 s = replace_once(
@@ -668,12 +661,10 @@ s = replace_once(
     "    float ExposureTrim;\n"
     "    uint32_t UseExposureWhitePoint;\n"
     "};\n",
-    "v2 constant tail",
+    "v5 constant tail",
 )
 write(rel, s)
 
-# D3D shader: fifth SRV was already present in the D3D root signature but unused by this shader.
-# Keep it D3D-only so the native Vulkan descriptor layout does not move.
 rel = "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
 s = read(rel)
 s = replace_once(
@@ -683,9 +674,8 @@ s = replace_once(
     "    float gExposureTrim;\n"
     "    uint  gUseExposureWhitePoint;\n"
     "};\n",
-    "v2 HLSL constant tail",
+    "v5 HLSL constant tail",
 )
-
 motion_decl = "Texture2D<float4>   gMotion   : register(t3);  // resolve, accumulating: the game's motion vectors.\n"
 s = replace_once(
     s,
@@ -694,9 +684,8 @@ s = replace_once(
     + "#ifndef VK_MODE\n"
       "Texture2D<float4>   gExposure : register(t4);  // generated 1x1 exposure for encode/resolve\n"
       "#endif\n",
-    "v2 exposure SRV",
+    "v5 exposure SRV",
 )
-
 luma_decl = "static const float3 kLuma = float3(0.2126, 0.7152, 0.0722);\n"
 effective_wp = r'''
 
@@ -713,7 +702,7 @@ float EffectiveWhitePoint()
 
         const float preExposure =
             (isfinite(gPreExposure) && gPreExposure > 1e-6) ? gPreExposure : 1.0;
-        const float trim = clamp(gExposureTrim, 0.25, 4.0);
+        const float trim = clamp(gExposureTrim, 0.25, 10.0);
         const float whitePoint = preExposure / exposure * trim;
 
         if (isfinite(whitePoint) && whitePoint > 0.0)
@@ -724,40 +713,35 @@ float EffectiveWhitePoint()
     return fallback;
 }
 '''
-s = replace_once(s, luma_decl, luma_decl + effective_wp, "v2 effective white point")
-
+s = replace_once(s, luma_decl, luma_decl + effective_wp, "v5 effective white point")
 s = replace_once(
     s,
     "        float3 display = SoftKnee(frame / max(gWhitePoint, 1e-4));\n",
     "        const float whitePoint = EffectiveWhitePoint();\n"
     "        float3 display = SoftKnee(frame / whitePoint);\n",
-    "v2 encode white point",
+    "v5 encode white point",
 )
 s = replace_once(
     s,
     "    const float normScale = gPassthrough != 0 ? 1.0 : max(gWhitePoint, 1e-4);\n",
     "    const float whitePoint = EffectiveWhitePoint();\n"
     "    const float normScale = gPassthrough != 0 ? 1.0 : whitePoint;\n",
-    "v2 resolve white point",
+    "v5 resolve white point",
 )
 s = replace_once(
     s,
     "        result = float3(gWhitePoint, gWhitePoint, gWhitePoint);\n",
     "        result = float3(whitePoint, whitePoint, whitePoint);\n",
-    "v2 comparison divider white point",
+    "v5 comparison divider white point",
 )
-
-# The base patch uses an explicit flag. A 1x1 dispatch remains a copy as a compatibility safety net
-# if this source is ever regenerated for Vulkan before its callers learn the new flag.
 s = replace_once(
     s,
     "        if (gMeterCopiesExposure != 0)\n",
     "        if (gMeterCopiesExposure != 0 || (gWidth == 1 && gHeight == 1))\n",
-    "v2 meter copy compatibility",
+    "v5 meter copy compatibility",
 )
 write(rel, s)
 
-# The fifth D3D SRV argument was explicitly vestigial. Rename it without changing the signature shape.
 rel = "OptiScaler/shaders/dlssnr/DlssNr_Dx12.h"
 s = read(rel)
 s = replace_once(
@@ -769,44 +753,36 @@ s = replace_once(
     "                  // Fifth SRV. Normally null; GPU auto exposure binds its 1x1 texture here for\n"
     "                  // encode and resolve. The descriptor-table shape is unchanged.\n"
     "                  ID3D12Resource* InExposure, ID3D12Resource* OutTarget,\n",
-    "v2 D3D12 header exposure SRV",
+    "v5 D3D12 header exposure SRV",
 )
 write(rel, s)
 
 rel = "OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp"
 s = read(rel)
-
-# WhitePointSource: 0 manual, 1 game only, 2 automatic, 3 calibrated scan.
 s = replace_once(
     s,
     "    if (cfg.DlssNrWhitePointSource.value_or_default() == 2)\n",
     "    if (cfg.DlssNrWhitePointSource.value_or_default() == 3)\n",
-    "v4 shift scan source to index 3",
+    "v5 shift scan source to index 3",
 )
-
-# Keep backend enforcement in sync with the UI: game exposure trim now reaches 10x.
 s = replace_once(
     s,
     "std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f)",
     "std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 10.0f)",
-    "v2 backend game trim max",
+    "v5 backend game trim max",
 )
-
-# Reuse the old fifth descriptor slot as t4 exposure.
 s = replace_once(
     s,
     "ID3D12Resource* InPrevEdit, ID3D12Resource* OutTarget,",
     "ID3D12Resource* InExposure, ID3D12Resource* OutTarget,",
-    "v2 D3D12 cpp exposure parameter",
+    "v5 D3D12 cpp exposure parameter",
 )
 s = replace_once(
     s,
     "InPrevEdit != nullptr ? InPrevEdit : InSource,",
     "InExposure != nullptr ? InExposure : InSource,",
-    "v2 D3D12 cpp exposure binding",
+    "v5 D3D12 cpp exposure binding",
 )
-
-# Parent semantics: selecting another white-point source disables both game exposure and our fallback.
 s = replace_once(
     s,
     "    ID3D12Resource* nrExposure = (ID3D12Resource*) frame.ExposureTexture;\n"
@@ -814,22 +790,20 @@ s = replace_once(
     "    const uint32_t whitePointSource = cfg.DlssNrWhitePointSource.value_or_default();\n"
     "    const bool gameExposureSelected = whitePointSource == 1;\n"
     "    const bool automaticExposureSelected = whitePointSource == 2;\n\n"
-    "    // Sources are mutually exclusive: auto ignores game ExposureTexture; game source never falls back.\n"
+    "    // Sources are mutually exclusive: auto ignores game ExposureTexture; game never falls back.\n"
     "    ID3D12Resource* nrExposure =\n"
     "        gameExposureSelected ? (ID3D12Resource*) frame.ExposureTexture : nullptr;\n"
     "    const bool nrExposureIsGame = nrExposure != nullptr;\n"
     "    bool usingAutoExposure = false;\n",
-    "v2 exposure parent semantics",
+    "v5 exposure source semantics",
 )
-
-# Calculate even with an older forwarder: composition itself can consume the 1x1 t4 texture.
 s = replace_once(
     s,
     "    if (g_nr.setExposure != nullptr && nrExposure == nullptr && isHdrBuffer &&\n"
     "        g_nr.meter != nullptr && g_nr.autoExposure != nullptr)\n",
     "    if (automaticExposureSelected && isHdrBuffer &&\n"
     "        g_nr.meter != nullptr && g_nr.autoExposure != nullptr)\n",
-    "v2 auto exposure gate",
+    "v5 auto exposure gate",
 )
 s = replace_once(
     s,
@@ -838,29 +812,24 @@ s = replace_once(
     "        g_nr.autoExposureReadable = true;\n"
     "        nrExposure = g_nr.autoExposure;\n"
     "        usingAutoExposure = true;\n",
-    "v2 auto exposure active flag",
+    "v5 auto exposure active flag",
 )
-
-# Feed the same GPU-generated 1x1 value to encode and resolve so the trim affects the composition
-# immediately, without a delayed CPU readback.
 s = replace_once(
     s,
-    "    encodeParams.WhitePoint = whitePoint;\n"
-    "    encodeParams.Width = width;\n",
+    "    encodeParams.WhitePoint = whitePoint;\n",
     "    encodeParams.WhitePoint = whitePoint;\n"
     "    encodeParams.PreExposure = frame.PreExposure;\n"
     "    encodeParams.ExposureTrim =\n"
-    "        std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 4.0f);\n"
-    "    encodeParams.UseExposureWhitePoint = usingAutoExposure ? 1u : 0u;\n"
-    "    encodeParams.Width = width;\n",
-    "v2 encode exposure constants",
+    "        std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 10.0f);\n"
+    "    encodeParams.UseExposureWhitePoint = usingAutoExposure ? 1u : 0u;\n",
+    "v5 encode exposure constants",
 )
 s = replace_once(
     s,
     "    DispatchPass(cmdList, encodeParams, source, nullptr, nullptr, nullptr, nullptr, g_nr.colorCopy, g_nr.hdrCopy);\n",
     "    DispatchPass(cmdList, encodeParams, source, nullptr, nullptr, nullptr,\n"
     "                 usingAutoExposure ? g_nr.autoExposure : nullptr, g_nr.colorCopy, g_nr.hdrCopy);\n",
-    "v2 encode exposure SRV",
+    "v5 encode exposure SRV",
 )
 s = replace_once(
     s,
@@ -868,9 +837,9 @@ s = replace_once(
     "    resolveParams.WhitePoint = whitePoint;\n"
     "    resolveParams.PreExposure = frame.PreExposure;\n"
     "    resolveParams.ExposureTrim =\n"
-    "        std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 4.0f);\n"
+    "        std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 10.0f);\n"
     "    resolveParams.UseExposureWhitePoint = usingAutoExposure ? 1u : 0u;\n",
-    "v2 resolve exposure constants",
+    "v5 resolve exposure constants",
 )
 s = replace_once(
     s,
@@ -878,8 +847,18 @@ s = replace_once(
     "                            nullptr, target, nullptr);\n",
     "    DispatchPass(cmdList, resolveParams, modelInput, work[answer], g_nr.hdrCopy, motionIn,\n"
     "                 usingAutoExposure ? g_nr.autoExposure : nullptr, target, nullptr);\n",
-    "v2 resolve exposure SRV",
+    "v5 resolve exposure SRV",
 )
 write(rel, s)
 
-print("DLSS-NR UI + separate Automatic Exposure source v4 applied")
+rel = "OptiScaler/dlssnr/DlssNrFeature_Vk.cpp"
+s = read(rel)
+s = replace_once(
+    s,
+    "std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f)",
+    "std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 10.0f)",
+    "Vulkan game exposure trim max",
+)
+write(rel, s)
+
+print("DLSS-NR Auto Exposure v5 patch applied")
