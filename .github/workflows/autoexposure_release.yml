@@ -23,6 +23,26 @@ jobs:
       - name: Apply DLSS-NR Auto Exposure patch in runner only
         shell: powershell
         run: |
+          # The clean upstream source has a comment between WhitePoint and Width in the encode block.
+          # The patcher used an older two-line anchor there, so make that one anchor tolerant before
+          # executing it. This changes only the runner copy; nothing is committed back to the branch.
+          $patcher = "${{ github.workspace }}\tools\apply_dlssnr_autoexposure.py"
+          $text = [System.IO.File]::ReadAllText($patcher)
+          $pattern = '(?m)^    "    encodeParams\.WhitePoint = whitePoint;\\n"\r?\n    "    encodeParams\.Width = width;\\n",$'
+          $replacement = '    "    encodeParams.WhitePoint = whitePoint;\n",'
+          $fixed = [System.Text.RegularExpressions.Regex]::Replace($text, $pattern, $replacement)
+
+          if ($fixed -eq $text) {
+            Write-Error "Could not update the v2 encode exposure anchor in the patcher."
+            exit 1
+          }
+
+          [System.IO.File]::WriteAllText(
+            $patcher,
+            $fixed,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
