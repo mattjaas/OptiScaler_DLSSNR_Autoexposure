@@ -23,28 +23,50 @@ jobs:
       - name: Apply DLSS-NR Auto Exposure patch in runner only
         shell: powershell
         run: |
-          # The clean upstream source has a comment between WhitePoint and Width in the encode block.
-          # The patcher used an older two-line anchor there, so make that one anchor tolerant before
-          # executing it. This changes only the runner copy; nothing is committed back to the branch.
+          # The patcher was authored against an older encode block where WhitePoint and Width
+          # were adjacent. In the clean upstream source there is now a comment between them.
+          # Remove only those two stale Width anchor lines from the runner copy of the patcher,
+          # so it inserts the new constants directly after WhitePoint and leaves the upstream
+          # Width line/comment untouched. Nothing here is committed back to the branch.
           $patcher = "${{ github.workspace }}\tools\apply_dlssnr_autoexposure.py"
-          $text = [System.IO.File]::ReadAllText($patcher)
-          $pattern = '(?m)^    "    encodeParams\.WhitePoint = whitePoint;\\n"\r?\n    "    encodeParams\.Width = width;\\n",$'
-          $replacement = '    "    encodeParams.WhitePoint = whitePoint;\n",'
-          $fixed = [System.Text.RegularExpressions.Regex]::Replace($text, $pattern, $replacement)
+          $lines = [System.Collections.Generic.List[string]]::new()
+          Get-Content $patcher | ForEach-Object { [void]$lines.Add($_) }
 
-          if ($fixed -eq $text) {
-            Write-Error "Could not update the v2 encode exposure anchor in the patcher."
+          $matches = @()
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -like '*encodeParams.Width = width*') {
+              $matches += $i
+            }
+          }
+
+          if ($matches.Count -ne 2) {
+            Write-Error "Expected exactly two stale encode Width anchors in the patcher, found $($matches.Count)."
             exit 1
           }
 
-          [System.IO.File]::WriteAllText(
+          for ($j = $matches.Count - 1; $j -ge 0; $j--) {
+            $lines.RemoveAt($matches[$j])
+          }
+
+          [System.IO.File]::WriteAllLines(
             $patcher,
-            $fixed,
+            $lines,
             [System.Text.UTF8Encoding]::new($false)
           )
 
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Cheap structural checks before spending time on FXC/MSBuild.
+          $dx12 = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Dx12.cpp" -Raw
+          $menu = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
+
+          if ($dx12 -notmatch 'UseExposureWhitePoint' -or
+              $dx12 -notmatch 'automaticExposureSelected' -or
+              $menu -notmatch 'Automatic exposure') {
+            Write-Error "Patch completed but expected Auto Exposure v4 markers are missing."
+            exit 1
+          }
 
       - name: Compile DLSS-NR D3D12 shader with FXC
         shell: powershell
