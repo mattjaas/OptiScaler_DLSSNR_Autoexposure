@@ -1,0 +1,151 @@
+name: DLSS-NR Auto Exposure - Build to Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout clean source
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply DLSS-NR Auto Exposure patch in runner only
+        shell: powershell
+        run: |
+          python .\tools\apply_dlssnr_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile DLSS-NR D3D12 shader with FXC
+        shell: powershell
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" `
+            -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $fxc) {
+            Write-Error "fxc.exe was not found in the Windows SDK on windows-latest."
+            exit 1
+          }
+
+          $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
+          Write-Host "Using FXC: $($fxc.FullName)"
+
+          & $fxc.FullName `
+            /nologo `
+            /T cs_5_0 `
+            /E CSMain `
+            /O3 `
+            /Fo "$dir\DlssNr_Shader.cso" `
+            /Fh "$dir\DlssNr_Shader.h" `
+            /Vn DlssNr_cso `
+            "$dir\dlssnr.hlsl"
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path "$dir\DlssNr_Shader.h")) {
+            Write-Error "FXC did not generate DlssNr_Shader.h"
+            exit 1
+          }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        shell: powershell
+        working-directory: ${{ github.workspace }}
+        run: |
+          msbuild /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} . /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Prepare release packages
+        id: package
+        shell: powershell
+        run: |
+          $out = "${{ github.workspace }}\x64\Release\a"
+
+          if (-not (Test-Path $out)) {
+            Write-Error "Expected build output not found: $out"
+            exit 1
+          }
+
+          if (Test-Path "${{ github.workspace }}\dist\README.md") {
+            Copy-Item "${{ github.workspace }}\dist\README.md" "$out\README.md" -Force
+          }
+
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $baseName = "OptiScaler_DLSSNR_AutoExposure_${shortSha}_run${{ github.run_number }}.${{ github.run_attempt }}"
+          $plain = "${{ github.workspace }}\$baseName.7z"
+          $withDlss = "${{ github.workspace }}\${baseName}_with_DLSS.7z"
+
+          7z a -r $plain "$out\*"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $streamlineTarget = "$out\OptiScaler\streamline"
+          New-Item -ItemType Directory -Force -Path $streamlineTarget | Out-Null
+
+          if (Test-Path "${{ github.workspace }}\dist\streamline") {
+            Copy-Item "${{ github.workspace }}\dist\streamline\*" $streamlineTarget -Force
+          }
+
+          if (Test-Path "${{ github.workspace }}\dist\nvngx") {
+            Copy-Item "${{ github.workspace }}\dist\nvngx\*" "$out\OptiScaler\" -Force
+          }
+
+          7z a -r $withDlss "$out\*"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          "plain=$plain" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "with_dlss=$withDlss" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish directly to GitHub Releases
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "autoexposure-build-${{ github.run_number }}.${{ github.run_attempt }}"
+          $title = "DLSS-NR Auto Exposure build ${{ github.run_number }}.${{ github.run_attempt }}"
+
+          $notes = @"
+          Experimental DLSS Neural Rendering Auto Exposure build.
+
+          Source branch: ${{ github.ref_name }}
+          Clean source commit: ${{ github.sha }}
+
+          White point sources:
+          - Paper white only;
+          - The game's own exposure: uses only the game's ExposureTexture, with trim up to 10x;
+          - Automatic exposure: always calculates exposure on GPU from original linear HDR and ignores game ExposureTexture;
+          - A buffer the scan found: existing calibrated scan path.
+
+          Automatic exposure is calculated once before Encode and the same 1x1 value is reused by Encode, all NR passes and Resolve.
+
+          This workflow never commits patched sources back to the branch and does not use actions/upload-artifact.
+          "@
+
+          gh release create $tag `
+            --target "${{ github.sha }}" `
+            --title $title `
+            --notes $notes
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          gh release upload $tag `
+            "${{ steps.package.outputs.plain }}" `
+            "${{ steps.package.outputs.with_dlss }}" `
+            --clobber
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          gh release view $tag --json url --jq .url
