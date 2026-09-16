@@ -15,7 +15,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          submodules: recursive
           fetch-depth: 1
 
       - name: Apply release-only patches
@@ -44,12 +43,3 @@ jobs:
           $fxcOutput | ForEach-Object { Write-Host $_ }
           Write-Host "FXC exit code: $fxcExit"
           if ($fxcExit -ne 0) { exit $fxcExit }
-
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Build Release x64
-        shell: powershell
-        run: |
-          msbuild /m /p:Configuration=Release . /verbosity:minimal
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
