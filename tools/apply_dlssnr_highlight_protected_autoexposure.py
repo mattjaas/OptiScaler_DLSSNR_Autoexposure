@@ -89,7 +89,7 @@ s = replace_once(
     "                config->DlssNrAutoExposureSimpleAverageFallback = simpleAverageFallback;\n\n"
     "            HelpMarker(\"Normally Automatic exposure uses a stable highlight-compressed arithmetic average.\"\n"
     "                       \"\\nEvery 64x64 tile remains part of the meter. A full-frame log-luminance mean\"\n"
-    "                       \"\\nis used only as a smooth brightness reference. Values up to 3 stops above\"\n"
+    "                       \"\\nis used only as a smooth brightness reference. Values up to 2 stops above\"\n"
     "                       \"\\nthat reference pass unchanged; brighter values are smoothly compressed,\"\n"
     "                       \"\\nnot removed. The final luminance is still a linear arithmetic mean and the\"\n"
     "                       \"\\noriginal exposure formula is unchanged. This avoids hard histogram-boundary\"\n"
@@ -153,7 +153,7 @@ write(rel, s)
 # -----------------------------------------------------------------------------
 # HLSL: stable soft highlight compression. All tiles remain in the final LINEAR
 # arithmetic mean. A full-frame mean in log2 luminance is used only as a smooth
-# reference. Above +3 EV from that reference, additional brightness grows at 35%
+# reference. Above +2 EV from that reference, additional brightness grows at 35%
 # of its original rate in EV. No histogram or hard membership boundaries remain.
 # The fallback branch preserves the previous full-frame arithmetic average exactly.
 # -----------------------------------------------------------------------------
@@ -185,7 +185,7 @@ if s.find("    if (gMode == 5)\n    {\n", auto_start + 1) >= 0:
 
 new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-average exposure math, but make
     // small extreme HDR highlights less dominant without ever dropping tiles from the meter.
-    // A full-frame log2-luminance mean is used only as a continuous reference. Up to +3 EV above
+    // A full-frame log2-luminance mean is used only as a continuous reference. Up to +2 EV above
     // that reference luminance passes unchanged. Beyond the knee, extra brightness grows at 35%
     // of its original rate in EV. This is continuous in camera motion and has no histogram-bin or
     // percentile-boundary switches. The emergency flag restores the old full-frame mean exactly.
@@ -238,7 +238,7 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
         if (gAutoExposureSimpleAverageFallback == 0u && totalPixels > 0.0)
         {
             const float referenceLogLuma = weightedSceneLogLuma / totalPixels;
-            const float highlightKneeEv = 3.0;
+            const float highlightKneeEv = 2.0;
             const float highlightCompressionSlope = 0.35;
             float protectedLinearSum = 0.0;
 
