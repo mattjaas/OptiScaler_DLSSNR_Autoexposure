@@ -25,10 +25,11 @@ def replace_once(text, old, new, label):
 
 
 # Runs after the Auto Exposure, Trim-anchor, FXC-compatibility and Base White Point patches.
-# The default Automatic exposure meter becomes highlight-protected: it works on the existing
-# 64x64 tile means, meters log-luminance, trims the distribution, and increases highlight
-# rejection when a small part of the frame sits several stops above the median. A persisted
-# emergency checkbox restores the exact simple arithmetic-average meter used previously.
+# Automatic exposure keeps the original arithmetic-average exposure formula, but by default
+# measures the dominant majority of the frame instead of allowing a small HDR-bright region to
+# dominate the mean. A log-luminance histogram is used only to select the majority interval;
+# the luminance average itself remains linear/arithmetic. A persisted emergency checkbox restores
+# the exact full-frame arithmetic-average meter used previously.
 
 # -----------------------------------------------------------------------------
 # Config: persisted emergency fallback switch.
@@ -86,15 +87,17 @@ s = replace_once(
     "            if (ImGui::Checkbox(\"Calculate the exposure using simple average (emergency fallback)\",\n"
     "                                &simpleAverageFallback))\n"
     "                config->DlssNrAutoExposureSimpleAverageFallback = simpleAverageFallback;\n\n"
-    "            HelpMarker(\"Normally Automatic exposure uses highlight-protected log-luminance metering.\"\n"
-    "                       \"\\nIt measures the existing 64x64 tile grid, trims the luminance distribution,\"\n"
-    "                       \"\\nand suppresses small very-bright regions several stops above the scene median.\"\n"
+    "            HelpMarker(\"Normally Automatic exposure uses a majority-selected arithmetic average.\"\n"
+    "                       \"\\nA log-luminance histogram is used only to find the narrowest continuous\"\n"
+    "                       \"\\nbrightness range covering 70% of the frame. The exposure luminance is then\"\n"
+    "                       \"\\ncomputed as the ordinary linear arithmetic mean of tiles in that range.\"\n"
+    "                       \"\\nThis prevents a small very-bright sky/window/specular region from dominating\"\n"
+    "                       \"\\na mostly dark frame while keeping the original exposure formula.\"\n"
     "                       \"\\n\\nEnable this only as an emergency compatibility fallback. It restores the\"\n"
-    "                       \"\\nprevious arithmetic mean of the whole frame, where small HDR highlights can\"\n"
-    "                       \"\\ndominate the exposure.\");\n\n"
+    "                       \"\\nprevious arithmetic mean of the entire frame.\");\n\n"
     "            ImGui::TextDisabled(simpleAverageFallback\n"
-    "                                    ? \"Metering: simple arithmetic average (emergency fallback).\"\n"
-    "                                    : \"Metering: highlight-protected log-luminance trimmed mean.\");\n\n"
+    "                                    ? \"Metering: full-frame arithmetic average (emergency fallback).\"\n"
+    "                                    : \"Metering: majority-selected 70% arithmetic average.\");\n\n"
     "            const auto autoStatus = DlssNr::AutoExposureStatus();\n"
     "            RenderExposureTrimAnchorControls(config->DlssNrAutoExposureTrimAnchors,\n",
     "automatic exposure fallback checkbox",
@@ -147,8 +150,10 @@ s = s.replace("0.25f, 10.0f", "0.25f, 50.0f")
 write(rel, s)
 
 # -----------------------------------------------------------------------------
-# HLSL: default highlight-protected tile meter. The fallback branch preserves
-# the previous arithmetic-average result exactly (same weighted tile sum and formula).
+# HLSL: majority-selected arithmetic meter. The log histogram only chooses the
+# dominant 70% brightness interval; the final luminance is an ordinary linear
+# arithmetic mean, and the original NVIDIA-style exposure formula is unchanged.
+# The fallback branch preserves the previous full-frame arithmetic average exactly.
 # -----------------------------------------------------------------------------
 rel = "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
 s = read(rel)
@@ -176,11 +181,12 @@ if auto_start < 0 or auto_end < 0 or auto_end <= auto_start:
 if s.find("    if (gMode == 5)\n    {\n", auto_start + 1) >= 0:
     raise RuntimeError("automatic exposure HLSL block appears more than once")
 
-new_auto = r'''    // Automatic exposure. The default meter is highlight-protected: the existing 64x64
-    // tile means are converted to scene log-luminance, the distribution is trimmed, and a small
-    // population several stops above the median increases the amount removed from the bright tail.
-    // This lets a small HDR sky/window/specular region coexist with a mostly dark frame without
-    // making the whole frame meter as bright. The emergency flag restores the old arithmetic mean.
+new_auto = r'''    // Automatic exposure. Keep the original arithmetic-average exposure math, but prevent
+    // a small, extremely bright HDR region from controlling a mostly dark frame. The 64x64 tile
+    // means are placed into a log-luminance histogram only to locate the narrowest continuous
+    // brightness interval containing 70% of the frame. The final metered luminance is then the
+    // ordinary LINEAR arithmetic mean of the tiles inside that majority interval.
+    // The emergency flag restores the old full-frame arithmetic mean exactly.
     if (gMode == 5)
     {
         if (id.x != 0 || id.y != 0)
@@ -195,11 +201,12 @@ new_auto = r'''    // Automatic exposure. The default meter is highlight-protect
         float totalPixels = 0.0;
         float histogram[64];
 
-        [loop] for (uint i = 0u; i < 64u; ++i)
-            histogram[i] = 0.0;
+        [loop] for (uint histogramInitIndex = 0u; histogramInitIndex < 64u; ++histogramInitIndex)
+            histogram[histogramInitIndex] = 0.0;
 
-        // First pass: preserve the exact old arithmetic-average accumulator for the fallback,
-        // and simultaneously build a pixel-area-weighted 0.5-stop log-luminance histogram.
+        // First pass: preserve the exact old full-frame arithmetic accumulator for the fallback,
+        // while the default path builds a pixel-area-weighted 0.5-stop histogram used only for
+        // selecting which brightness population should contribute to that same arithmetic mean.
         [loop] for (uint ty = 0u; ty < 64u; ++ty)
         {
             const uint y0 = (ty * srcH) / 64u;
@@ -233,100 +240,94 @@ new_auto = r'''    // Automatic exposure. The default meter is highlight-protect
 
         if (gAutoExposureSimpleAverageFallback == 0u && totalPixels > 0.0)
         {
-            // Median of the tile distribution. "Extreme highlight" means 3 stops (8x) above it.
+            // Find the median bin only as a stable tie-breaker. The selected interval itself is the
+            // narrowest contiguous set of histogram bins containing at least 70% of the image.
             const float medianTarget = totalPixels * 0.5;
-            float cumulative = 0.0;
+            float cumulativeForMedian = 0.0;
             uint medianBin = 0u;
-            [loop] for (uint i = 0u; i < 64u; ++i)
+            [loop] for (uint medianIndex = 0u; medianIndex < 64u; ++medianIndex)
             {
-                cumulative += histogram[i];
-                if (cumulative >= medianTarget)
+                cumulativeForMedian += histogram[medianIndex];
+                if (cumulativeForMedian >= medianTarget)
                 {
-                    medianBin = i;
+                    medianBin = medianIndex;
                     break;
                 }
             }
 
-            const float medianLogLuma = -16.0 + ((float) medianBin + 0.5) * 0.5;
-            const float highlightThreshold = medianLogLuma + 3.0;
-            float highlightPixels = 0.0;
-            [loop] for (uint i = 0u; i < 64u; ++i)
+            const float majorityTarget = totalPixels * 0.70;
+            uint majorityLowBin = 0u;
+            uint majorityHighBin = 63u;
+            uint bestBinWidth = 64u;
+            float bestCenterDistance = 1e9;
+
+            [loop] for (uint lowBin = 0u; lowBin < 64u; ++lowBin)
             {
-                const float binCenter = -16.0 + ((float) i + 0.5) * 0.5;
-                if (binCenter > highlightThreshold)
-                    highlightPixels += histogram[i];
-            }
-
-            const float highlightCoverage = saturate(highlightPixels / totalPixels);
-
-            // Always drop the hottest 5%. If a small part of the picture is >3 stops above the
-            // median, smoothly trim approximately that whole bright population. Once such regions
-            // occupy ~30% of the screen they are treated as scene content rather than an outlier.
-            const float smallHighlightProtection = 1.0 - smoothstep(0.15, 0.30, highlightCoverage);
-            const float upperTrimFraction =
-                min(max(0.05, highlightCoverage * smallHighlightProtection), 0.20);
-            const float lowTarget = totalPixels * 0.01;
-            const float highTarget = totalPixels * (1.0 - upperTrimFraction);
-
-            uint lowBin = 0u;
-            uint highBin = 63u;
-            cumulative = 0.0;
-            bool lowFound = false;
-            [loop] for (uint i = 0u; i < 64u; ++i)
-            {
-                cumulative += histogram[i];
-                if (!lowFound && cumulative >= lowTarget)
+                float intervalPixels = 0.0;
+                [loop] for (uint highBin = lowBin; highBin < 64u; ++highBin)
                 {
-                    lowBin = i;
-                    lowFound = true;
-                }
-                if (cumulative >= highTarget)
-                {
-                    highBin = i;
-                    break;
-                }
-            }
-
-            const float lowLogCut = -16.0 + (float) lowBin * 0.5;
-            const float highLogCut = -16.0 + (float) (highBin + 1u) * 0.5;
-            float trimmedLogSum = 0.0;
-            float trimmedPixels = 0.0;
-
-            // Second pass: exact log values inside the selected percentile window. This avoids
-            // quantising the final mean to histogram-bin centres while keeping the histogram tiny.
-            [loop] for (uint ty = 0u; ty < 64u; ++ty)
-            {
-                const uint y0 = (ty * srcH) / 64u;
-                const uint y1 = ((ty + 1u) * srcH) / 64u;
-                const uint tileH = max(y1 - y0, 1u);
-
-                [loop] for (uint tx = 0u; tx < 64u; ++tx)
-                {
-                    const uint x0 = (tx * srcW) / 64u;
-                    const uint x1 = ((tx + 1u) * srcW) / 64u;
-                    const uint tileW = max(x1 - x0, 1u);
-                    const float pixels = (float) tileW * (float) tileH;
-                    const float tileMean = max(SanitizeFinite(gSource.Load(int3(tx, ty, 0)).r, 0.0), 0.0);
-                    const float sceneLuma = max(tileMean / preExposure, 1e-8);
-                    const float logLuma = clamp(log2(sceneLuma), -16.0, 16.0);
-
-                    if (logLuma >= lowLogCut && logLuma <= highLogCut)
+                    intervalPixels += histogram[highBin];
+                    if (intervalPixels >= majorityTarget)
                     {
-                        trimmedLogSum += logLuma * pixels;
-                        trimmedPixels += pixels;
+                        const uint binWidth = highBin - lowBin;
+                        const float intervalCenter = ((float) lowBin + (float) highBin) * 0.5;
+                        const float centerDistance = abs(intervalCenter - (float) medianBin);
+
+                        if (binWidth < bestBinWidth ||
+                            (binWidth == bestBinWidth && centerDistance < bestCenterDistance))
+                        {
+                            bestBinWidth = binWidth;
+                            bestCenterDistance = centerDistance;
+                            majorityLowBin = lowBin;
+                            majorityHighBin = highBin;
+                        }
+                        break;
                     }
                 }
             }
 
-            if (trimmedPixels > 0.0)
+            const float majorityLowLog = -16.0 + (float) majorityLowBin * 0.5;
+            const float majorityHighLog = -16.0 + (float) (majorityHighBin + 1u) * 0.5;
+            float majorityLinearSum = 0.0;
+            float majorityPixels = 0.0;
+
+            // Second pass: membership is decided in log space, but the quantity being averaged is
+            // the original LINEAR scene luminance. This deliberately keeps the old exposure math.
+            [loop] for (uint majorityTy = 0u; majorityTy < 64u; ++majorityTy)
             {
-                const float trimmedMeanLogLuma = trimmedLogSum / trimmedPixels;
-                const float protectedSceneLuma = exp2(trimmedMeanLogLuma);
-                if (isfinite(protectedSceneLuma) && protectedSceneLuma > 1e-8)
-                    meteredSceneLuma = protectedSceneLuma;
+                const uint y0 = (majorityTy * srcH) / 64u;
+                const uint y1 = ((majorityTy + 1u) * srcH) / 64u;
+                const uint tileH = max(y1 - y0, 1u);
+
+                [loop] for (uint majorityTx = 0u; majorityTx < 64u; ++majorityTx)
+                {
+                    const uint x0 = (majorityTx * srcW) / 64u;
+                    const uint x1 = ((majorityTx + 1u) * srcW) / 64u;
+                    const uint tileW = max(x1 - x0, 1u);
+                    const float pixels = (float) tileW * (float) tileH;
+                    const float tileMean = max(
+                        SanitizeFinite(gSource.Load(int3(majorityTx, majorityTy, 0)).r, 0.0), 0.0);
+                    const float sceneLuma = max(tileMean / preExposure, 1e-8);
+                    const float logLuma = clamp(log2(sceneLuma), -16.0, 16.0);
+
+                    if (logLuma >= majorityLowLog && logLuma <= majorityHighLog)
+                    {
+                        majorityLinearSum += sceneLuma * pixels;
+                        majorityPixels += pixels;
+                    }
+                }
+            }
+
+            if (majorityPixels > 0.0)
+            {
+                const float majorityAverageSceneLuma = majorityLinearSum / majorityPixels;
+                if (isfinite(majorityAverageSceneLuma) && majorityAverageSceneLuma > 1e-8)
+                    meteredSceneLuma = majorityAverageSceneLuma;
             }
         }
 
+        // Keep the original exposure formula unchanged. Only the population used to obtain the
+        // arithmetic average above differs from the full-frame fallback.
         float exposure = meteredSceneLuma > 1e-8
             ? 0.18 / (meteredSceneLuma * 0.82)
             : 1.0;
@@ -342,4 +343,4 @@ new_auto = r'''    // Automatic exposure. The default meter is highlight-protect
 s = s[:auto_start] + new_auto + s[auto_end:]
 write(rel, s)
 
-print("DLSS-NR highlight-protected Automatic exposure + 50x Trim patch applied")
+print("DLSS-NR majority-selected arithmetic Automatic exposure + 50x Trim patch applied")
