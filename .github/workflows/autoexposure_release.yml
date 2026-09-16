@@ -29,10 +29,16 @@ jobs:
           python -m py_compile .\tools\apply_dlssnr_exposure_trim_anchors.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           python .\tools\apply_dlssnr_exposure_trim_anchors.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Structural checks before spending time on FXC/MSBuild.
@@ -52,6 +58,7 @@ jobs:
               $menu -notmatch 'if \(wpSource == 3\)' -or
               $scan -notmatch 'DlssNrWhitePointSource\.value_or_default\(\) == 3' -or
               $hlsl -notmatch 'EffectiveExposureTrim' -or
+              $hlsl -notmatch 'InterpolateExposureTrimSegment' -or
               $hlsl -notmatch 'gExposureTrimAnchorCount') {
             Write-Error "Patch completed but expected Auto Exposure / Trim Anchor markers are missing."
             exit 1
