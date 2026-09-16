@@ -26,7 +26,25 @@ jobs:
           python -m py_compile .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_anchors.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python -m py_compile .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python .\tools\apply_dlssnr_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_exposure_trim_anchors.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_whitepoint_trim_axis.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Structural checks before spending time on FXC/MSBuild.
@@ -37,12 +55,21 @@ jobs:
 
           if ($dx12 -notmatch 'automaticExposureSelected' -or
               $dx12 -notmatch 'DlssNrAutoExposureTrim\.value_or_default\(\), 0\.25f, 10\.0f' -or
+              $dx12 -notmatch 'AutoExposureStatus' -or
+              $dx12 -notmatch 'ExposureTrimForRuntime' -or
+              $dx12 -notmatch 'baseWhitePoint = g_nr\.gamePreExposure / g_nr\.gameExposure' -or
               $menu -notmatch 'Automatic exposure' -or
               $menu -notmatch 'Trim \(x automatic exposure\).*10\.0f' -or
+              $menu -notmatch 'Preview Trim value for actual scene' -or
+              $menu -notmatch 'Add Anchor point' -or
+              $menu -notmatch 'Current base white point' -or
               $menu -notmatch 'if \(wpSource == 3\)' -or
               $scan -notmatch 'DlssNrWhitePointSource\.value_or_default\(\) == 3' -or
-              $hlsl -notmatch 'clamp\(gExposureTrim, 0\.25, 10\.0\)') {
-            Write-Error "Patch completed but expected Auto Exposure v5 markers are missing."
+              $hlsl -notmatch 'EffectiveExposureTrim' -or
+              $hlsl -notmatch 'InterpolateExposureTrimSegment' -or
+              $hlsl -notmatch 'baseWhitePoint = preExposure / exposure' -or
+              $hlsl -notmatch 'gExposureTrimAnchorCount') {
+            Write-Error "Patch completed but expected Auto Exposure / Trim Anchor markers are missing."
             exit 1
           }
 
@@ -149,7 +176,9 @@ jobs:
           - Automatic exposure: always calculates exposure on GPU from original linear HDR, ignores game ExposureTexture, trim up to 10x;
           - A buffer the scan found: calibrated scan path; meter and anchors appear only for this source.
 
-          Automatic exposure is calculated once before Encode and the same 1x1 value is reused by Encode, all NR passes and Resolve.
+          Game exposure and Automatic exposure support Base White Point-dependent Trim Anchor points. Each point stores the untrimmed Base White Point (PreExposure / Exposure) and the selected Trim. With no points the Trim slider is used, one point fixes Trim for the whole range, and multiple points are interpolated logarithmically between Base White Point values. The Preview Trim value for actual scene option temporarily bypasses anchors while calibrating a new point.
+
+          Automatic exposure is calculated once before Encode and the same 1x1 value is reused by Encode, all NR passes and Resolve. Its Trim anchors are evaluated against the same-frame Base White Point in the shader; the CPU readback is only for the menu and Anchor-point capture.
 
           This workflow never commits patched sources back to the branch and does not use actions/upload-artifact.
           "@
