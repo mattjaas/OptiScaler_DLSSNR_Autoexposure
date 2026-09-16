@@ -24,9 +24,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m py_compile .\tools\apply_dlssnr_exposure_trim_anchors.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_exposure_trim_anchors.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Compile D3D12 shader
