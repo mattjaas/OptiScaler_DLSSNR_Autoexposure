@@ -15,6 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
         with:
+          submodules: recursive
           fetch-depth: 1
 
       - name: Apply release-only patches
@@ -26,6 +27,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_exposure_trim_anchors.py
@@ -42,8 +44,14 @@ jobs:
           if (-not $fxc) { Write-Error "fxc.exe not found"; exit 1 }
           $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
           Write-Host "Using FXC: $($fxc.FullName)"
-          $fxcOutput = & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl" 2>&1
-          $fxcExit = $LASTEXITCODE
-          $fxcOutput | ForEach-Object { Write-Host $_ }
-          Write-Host "FXC exit code: $fxcExit"
-          if ($fxcExit -ne 0) { exit $fxcExit }
+          & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        shell: powershell
+        run: |
+          msbuild /m /p:Configuration=Release . /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
