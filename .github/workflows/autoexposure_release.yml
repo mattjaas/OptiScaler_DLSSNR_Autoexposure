@@ -68,7 +68,7 @@ jobs:
               $menu -notmatch 'Automatic exposure' -or
               $menu -notmatch 'Trim \(x automatic exposure\).*50\.0f' -or
               $menu -notmatch 'Calculate the exposure using simple average \(emergency fallback\)' -or
-              $menu -notmatch 'stable symmetric outlier-compressed arithmetic average' -or
+              $menu -notmatch 'stable highlight-compressed arithmetic average' -or
               $menu -notmatch 'Preview Trim value for actual scene' -or
               $menu -notmatch 'Add Anchor point' -or
               $menu -notmatch 'Current base white point' -or
@@ -79,8 +79,7 @@ jobs:
               $hlsl -notmatch 'baseWhitePoint = preExposure / exposure' -or
               $hlsl -notmatch 'gAutoExposureSimpleAverageFallback' -or
               $hlsl -notmatch 'weightedSceneLogLuma' -or
-              $hlsl -notmatch 'outlierCompressionSlope = 0\.35' -or
-              $hlsl -notmatch 'deltaEv < -outlierKneeEv' -or
+              $hlsl -notmatch 'highlightCompressionSlope = 0\.35' -or
               $hlsl -notmatch 'compressedSceneLuma' -or
               $hlsl -notmatch '0\.18 / \(meteredSceneLuma \* 0\.82\)' -or
               $hlsl -notmatch 'gExposureTrimAnchorCount') {
@@ -191,7 +190,7 @@ jobs:
           - Automatic exposure: always calculates exposure on GPU from original linear HDR, ignores game ExposureTexture, trim up to 50x;
           - A buffer the scan found: calibrated scan path; meter and anchors appear only for this source.
 
-          Automatic exposure keeps the original arithmetic-average exposure formula. By default every tile remains in the meter. A full-frame log-luminance mean is used only as a smooth reference; luminance within +/-3 EV of that reference is unchanged, while more extreme bright and dark outliers are symmetrically compressed so further distance grows at 35% of its original EV rate. The final metered luminance remains a pixel-area-weighted linear arithmetic mean, with no histogram-bin or percentile-boundary selection. The "Calculate the exposure using simple average (emergency fallback)" checkbox restores the previous arithmetic average of the entire frame.
+          Automatic exposure keeps the original arithmetic-average exposure formula. By default every tile remains in the meter. A full-frame log-luminance mean is used only as a smooth reference; luminance up to +3 EV above that reference is unchanged, while brighter outliers are compressed so further brightness grows at 35% of its original EV rate. The final metered luminance remains a pixel-area-weighted linear arithmetic mean, with no histogram-bin or percentile-boundary selection. The "Calculate the exposure using simple average (emergency fallback)" checkbox restores the previous arithmetic average of the entire frame.
 
           Game exposure and Automatic exposure support Base White Point-dependent Trim Anchor points. Each point stores the untrimmed Base White Point (PreExposure / Exposure) and the selected Trim. With no points the Trim slider is used, one point fixes Trim for the whole range, and multiple points are interpolated logarithmically between Base White Point values. The Preview Trim value for actual scene option temporarily bypasses anchors while calibrating a new point.
 
