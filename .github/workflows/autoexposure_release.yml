@@ -197,10 +197,13 @@ jobs:
           This workflow never commits patched sources back to the branch and does not use actions/upload-artifact.
           "@
 
+          $notesFile = Join-Path $env:RUNNER_TEMP "autoexposure-release-notes.md"
+          $notes | Set-Content -Path $notesFile -Encoding utf8
+
           gh release create $tag `
             --target "${{ github.sha }}" `
             --title $title `
-            --notes $notes
+            --notes-file $notesFile
 
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
