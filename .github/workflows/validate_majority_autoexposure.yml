@@ -1,0 +1,68 @@
+name: Validate majority auto exposure
+
+on:
+  push:
+    branches:
+      - dlss-neural-rendering
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply patches
+        shell: powershell
+        run: |
+          python -m py_compile .\tools\apply_dlssnr_autoexposure.py
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_anchors.py
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          python -m py_compile .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          python -m py_compile .\tools\apply_dlssnr_highlight_protected_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_exposure_trim_anchors.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_highlight_protected_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $hlsl = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl" -Raw
+          if ($hlsl -notmatch 'majorityTarget' -or
+              $hlsl -notmatch 'majorityLinearSum' -or
+              $hlsl -notmatch '0\.18 / \(meteredSceneLuma \* 0\.82\)') {
+            Write-Error "Majority arithmetic metering markers are missing."
+            exit 1
+          }
+
+      - name: Compile DLSS-NR shader with FXC
+        shell: powershell
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $fxc) { Write-Error "fxc.exe not found"; exit 1 }
+          $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
+          & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Release x64
+        shell: powershell
+        run: |
+          msbuild /m /p:Configuration=Release . /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
