@@ -8,6 +8,22 @@ ROOT = next((p for p in _candidates if (p / "OptiScaler").is_dir()), None)
 if ROOT is None:
     raise RuntimeError("Run this script from the repository root (the directory containing OptiScaler).")
 
+# The anchor patch replaces NrState::meterExposureValid with meterExposureKind, but the
+# original Auto Exposure patch has a second cleanup loop later in DlssNr_Dx12.cpp. Replace
+# that remaining loop after both earlier patches have run.
+dx_rel = "OptiScaler/shaders/dlssnr/DlssNr_Dx12.cpp"
+dx_path = ROOT / dx_rel
+dx = dx_path.read_text(encoding="utf-8-sig")
+old_cleanup = "    for (bool& valid : g_nr.meterExposureValid)\n        valid = false;\n"
+new_cleanup = "    for (unsigned int& kind : g_nr.meterExposureKind)\n        kind = 0u;\n"
+cleanup_count = dx.count(old_cleanup)
+if cleanup_count != 1:
+    raise RuntimeError(f"remaining meter exposure cleanup: expected exactly one match, got {cleanup_count}")
+dx = dx.replace(old_cleanup, new_cleanup, 1)
+dx_path.write_text(dx, encoding="utf-8", newline="\n")
+
+# FXC can overflow its own stack when the first version of the 8-anchor helper is aggressively
+# expanded. Replace it with an equivalent explicit seven-segment implementation.
 rel = "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
 path = ROOT / rel
 s = path.read_text(encoding="utf-8-sig")
@@ -84,4 +100,4 @@ float EffectiveExposureTrim(float exposure)
 
 s = s[:old_start] + new + s[old_end:]
 path.write_text(s, encoding="utf-8", newline="\n")
-print("DLSS-NR exposure Trim FXC compatibility fix applied")
+print("DLSS-NR exposure Trim FXC/C++ compatibility fixes applied")
