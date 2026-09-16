@@ -1,4 +1,4 @@
-name: Validate exposure Trim anchors
+name: Validate base white-point Trim anchors
 
 on:
   push:
@@ -27,6 +27,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m py_compile .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -34,6 +36,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $dx12 = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Dx12.cpp" -Raw
+          $menu = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
+          $hlsl = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl" -Raw
+          if ($dx12 -notmatch 'baseWhitePoint = g_nr\.gamePreExposure / g_nr\.gameExposure' -or
+              $menu -notmatch 'Current base white point' -or
+              $hlsl -notmatch 'baseWhitePoint = preExposure / exposure') {
+            Write-Error "Base White Point Trim-anchor patch markers are missing."
+            exit 1
+          }
 
       - name: Compile D3D12 shader
         shell: powershell
