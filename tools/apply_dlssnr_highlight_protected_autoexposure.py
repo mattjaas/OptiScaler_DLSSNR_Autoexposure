@@ -26,10 +26,11 @@ def replace_once(text, old, new, label):
 
 # Runs after the Auto Exposure, Trim-anchor, FXC-compatibility and Base White Point patches.
 # Automatic exposure keeps the original linear arithmetic-average exposure formula. By default,
-# every tile remains in the meter, but very bright outliers are smoothly compressed relative to a
-# stable full-frame log-luminance reference before the linear arithmetic mean is taken. There are
-# no histogram buckets and no hard include/exclude decisions, avoiding exposure jumps when the
-# camera moves slightly. A persisted emergency checkbox restores the exact old full-frame mean.
+# every tile remains in the meter, while extreme bright and dark outliers are smoothly compressed
+# relative to a stable full-frame log-luminance reference before the linear arithmetic mean is
+# taken. There are no histogram buckets and no hard include/exclude decisions, avoiding exposure
+# jumps when the camera moves slightly. A persisted emergency checkbox restores the exact old
+# full-frame mean.
 
 # -----------------------------------------------------------------------------
 # Config: persisted emergency fallback switch.
@@ -87,18 +88,19 @@ s = replace_once(
     "            if (ImGui::Checkbox(\"Calculate the exposure using simple average (emergency fallback)\",\n"
     "                                &simpleAverageFallback))\n"
     "                config->DlssNrAutoExposureSimpleAverageFallback = simpleAverageFallback;\n\n"
-    "            HelpMarker(\"Normally Automatic exposure uses a stable highlight-compressed arithmetic average.\"\n"
+    "            HelpMarker(\"Normally Automatic exposure uses a stable outlier-compressed arithmetic average.\"\n"
     "                       \"\\nEvery 64x64 tile remains part of the meter. A full-frame log-luminance mean\"\n"
-    "                       \"\\nis used only as a smooth brightness reference. Values up to 3 stops above\"\n"
-    "                       \"\\nthat reference pass unchanged; brighter values are smoothly compressed,\"\n"
-    "                       \"\\nnot removed. The final luminance is still a linear arithmetic mean and the\"\n"
-    "                       \"\\noriginal exposure formula is unchanged. This avoids hard histogram-boundary\"\n"
-    "                       \"\\njumps while limiting small extreme HDR highlights.\"\n"
+    "                       \"\\nis used only as a smooth brightness reference. Values within +/-3 stops\"\n"
+    "                       \"\\nof that reference pass unchanged; more extreme bright or dark values are\"\n"
+    "                       \"\\nsymmetrically compressed, not removed. The final luminance is still a linear\"\n"
+    "                       \"\\narithmetic mean and the original exposure formula is unchanged.\"\n"
+    "                       \"\\nThis avoids hard histogram-boundary jumps while limiting small extreme\"\n"
+    "                       \"\\nbright or dark regions.\"\n"
     "                       \"\\n\\nEnable this only as an emergency compatibility fallback. It restores the\"\n"
     "                       \"\\nprevious arithmetic mean of the entire frame.\");\n\n"
     "            ImGui::TextDisabled(simpleAverageFallback\n"
     "                                    ? \"Metering: full-frame arithmetic average (emergency fallback).\"\n"
-    "                                    : \"Metering: stable highlight-compressed arithmetic average.\");\n\n"
+    "                                    : \"Metering: stable symmetric outlier-compressed arithmetic average.\");\n\n"
     "            const auto autoStatus = DlssNr::AutoExposureStatus();\n"
     "            RenderExposureTrimAnchorControls(config->DlssNrAutoExposureTrimAnchors,\n",
     "automatic exposure fallback checkbox",
@@ -151,10 +153,10 @@ s = s.replace("0.25f, 10.0f", "0.25f, 50.0f")
 write(rel, s)
 
 # -----------------------------------------------------------------------------
-# HLSL: stable soft highlight compression. All tiles remain in the final LINEAR
-# arithmetic mean. A full-frame mean in log2 luminance is used only as a smooth
-# reference. Above +3 EV from that reference, additional brightness grows at 35%
-# of its original rate in EV. No histogram or hard membership boundaries remain.
+# HLSL: stable symmetric soft outlier compression. All tiles remain in the final
+# LINEAR arithmetic mean. A full-frame mean in log2 luminance is used only as a
+# smooth reference. Outside +/-3 EV from that reference, additional distance grows
+# at 35% of its original rate in EV. No histogram or hard membership boundaries remain.
 # The fallback branch preserves the previous full-frame arithmetic average exactly.
 # -----------------------------------------------------------------------------
 rel = "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
@@ -184,11 +186,11 @@ if s.find("    if (gMode == 5)\n    {\n", auto_start + 1) >= 0:
     raise RuntimeError("automatic exposure HLSL block appears more than once")
 
 new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-average exposure math, but make
-    // small extreme HDR highlights less dominant without ever dropping tiles from the meter.
-    // A full-frame log2-luminance mean is used only as a continuous reference. Up to +3 EV above
-    // that reference luminance passes unchanged. Beyond the knee, extra brightness grows at 35%
-    // of its original rate in EV. This is continuous in camera motion and has no histogram-bin or
-    // percentile-boundary switches. The emergency flag restores the old full-frame mean exactly.
+    // small extreme HDR-bright and very-dark regions less dominant without ever dropping tiles.
+    // A full-frame log2-luminance mean is used only as a continuous reference. Within +/-3 EV of
+    // that reference luminance passes unchanged. Beyond either knee, additional distance from the
+    // reference grows at 35% of its original EV rate. This is continuous in camera motion and has
+    // no histogram-bin or percentile-boundary switches. The emergency flag restores the old mean.
     if (gMode == 5)
     {
         if (id.x != 0 || id.y != 0)
@@ -238,12 +240,12 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
         if (gAutoExposureSimpleAverageFallback == 0u && totalPixels > 0.0)
         {
             const float referenceLogLuma = weightedSceneLogLuma / totalPixels;
-            const float highlightKneeEv = 3.0;
-            const float highlightCompressionSlope = 0.35;
+            const float outlierKneeEv = 3.0;
+            const float outlierCompressionSlope = 0.35;
             float protectedLinearSum = 0.0;
 
-            // Second pass: every tile contributes by its real pixel area. Only the luminance value
-            // of strong bright outliers is softly compressed; there is no hard selection step.
+            // Second pass: every tile contributes by its real pixel area. Strong bright or dark
+            // outliers are softly pulled toward the reference; there is no hard selection step.
             [loop] for (uint protectedTy = 0u; protectedTy < 64u; ++protectedTy)
             {
                 const uint y0 = (protectedTy * srcH) / 64u;
@@ -263,10 +265,15 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
                     const float deltaEv = logLuma - referenceLogLuma;
 
                     float compressedLogLuma = logLuma;
-                    if (deltaEv > highlightKneeEv)
+                    if (deltaEv > outlierKneeEv)
                     {
-                        compressedLogLuma = referenceLogLuma + highlightKneeEv +
-                            (deltaEv - highlightKneeEv) * highlightCompressionSlope;
+                        compressedLogLuma = referenceLogLuma + outlierKneeEv +
+                            (deltaEv - outlierKneeEv) * outlierCompressionSlope;
+                    }
+                    else if (deltaEv < -outlierKneeEv)
+                    {
+                        compressedLogLuma = referenceLogLuma - outlierKneeEv +
+                            (deltaEv + outlierKneeEv) * outlierCompressionSlope;
                     }
 
                     const float compressedSceneLuma = exp2(clamp(compressedLogLuma, -24.0, 24.0));
@@ -279,8 +286,8 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
                 meteredSceneLuma = protectedAverageSceneLuma;
         }
 
-        // Keep the original NVIDIA-style exposure formula unchanged. Only extreme bright outlier
-        // contributions to the arithmetic mean above are compressed in the default meter.
+        // Keep the original NVIDIA-style exposure formula unchanged. Only extreme bright/dark
+        // outlier contributions to the arithmetic mean above are symmetrically compressed.
         float exposure = meteredSceneLuma > 1e-8
             ? 0.18 / (meteredSceneLuma * 0.82)
             : 1.0;
@@ -296,4 +303,4 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
 s = s[:auto_start] + new_auto + s[auto_end:]
 write(rel, s)
 
-print("DLSS-NR stable highlight-compressed Automatic exposure + 50x Trim patch applied")
+print("DLSS-NR stable symmetric outlier-compressed Automatic exposure + 50x Trim patch applied")
