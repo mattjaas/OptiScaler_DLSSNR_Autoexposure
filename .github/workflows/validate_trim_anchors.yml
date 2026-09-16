@@ -38,8 +38,12 @@ jobs:
             Select-Object -First 1
           if (-not $fxc) { Write-Error "fxc.exe not found"; exit 1 }
           $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
-          & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Using FXC: $($fxc.FullName)"
+          $fxcOutput = & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl" 2>&1
+          $fxcExit = $LASTEXITCODE
+          $fxcOutput | ForEach-Object { Write-Host $_ }
+          Write-Host "FXC exit code: $fxcExit"
+          if ($fxcExit -ne 0) { exit $fxcExit }
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
