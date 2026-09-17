@@ -25,14 +25,20 @@ def replace_once(text, old, new, label):
 
 
 # Runs after the Auto Exposure, Trim-anchor, FXC-compatibility and Base White Point patches.
-# Automatic exposure keeps the original linear arithmetic-average exposure formula. By default,
-# every tile remains in the meter, but very bright outliers are smoothly compressed relative to a
-# stable full-frame log-luminance reference before the linear arithmetic mean is taken. There are
-# no histogram buckets and no hard include/exclude decisions, avoiding exposure jumps when the
-# camera moves slightly. A persisted emergency checkbox restores the exact old full-frame mean.
+# Automatic exposure keeps the original linear arithmetic-average exposure formula. Every tile
+# remains in the meter, while the user-controlled Shadow protection from bright highlights slider
+# smoothly compresses bright outliers relative to a stable full-frame log-luminance reference.
+# There are no histogram buckets and no hard include/exclude decisions, avoiding exposure jumps
+# when the camera moves slightly. 0% restores the exact old full-frame arithmetic average;
+# 100% starts compression at +1 EV with a 0.35 EV slope. The default is 100%.
+#
+# The slider maps linearly:
+#   protection = 0%   -> knee +3 EV, slope 1.00 (exact old average path)
+#   protection = 100% -> knee +1 EV, slope 0.35
+# Intermediate values linearly interpolate both parameters.
 
 # -----------------------------------------------------------------------------
-# Config: persisted emergency fallback switch.
+# Config: persisted shadow-protection strength.
 # -----------------------------------------------------------------------------
 rel = "OptiScaler/Config.h"
 s = read(rel)
@@ -41,9 +47,9 @@ s = replace_once(
     "    CustomOptional<float> DlssNrAutoExposureTrim { 1.0f };\n\n"
     "    // Base-white-point-dependent Trim calibration tables, serialized as baseWhitePoint:trim pairs.\n",
     "    CustomOptional<float> DlssNrAutoExposureTrim { 1.0f };\n"
-    "    CustomOptional<bool> DlssNrAutoExposureSimpleAverageFallback { false };\n\n"
+    "    CustomOptional<float> DlssNrAutoExposureShadowProtection { 100.0f };\n\n"
     "    // Base-white-point-dependent Trim calibration tables, serialized as baseWhitePoint:trim pairs.\n",
-    "auto exposure fallback config field",
+    "auto exposure shadow protection config field",
 )
 write(rel, s)
 
@@ -54,10 +60,10 @@ s = replace_once(
     "            DlssNrAutoExposureTrim.set_from_config(readFloat(\"DlssNr\", \"AutoExposureTrim\"));\n"
     "            DlssNrGameExposureTrimAnchors.set_from_config(readString(\"DlssNr\", \"GameExposureTrimAnchors\"));\n",
     "            DlssNrAutoExposureTrim.set_from_config(readFloat(\"DlssNr\", \"AutoExposureTrim\"));\n"
-    "            DlssNrAutoExposureSimpleAverageFallback.set_from_config(\n"
-    "                readBool(\"DlssNr\", \"AutoExposureSimpleAverageFallback\"));\n"
+    "            DlssNrAutoExposureShadowProtection.set_from_config(\n"
+    "                readFloat(\"DlssNr\", \"AutoExposureShadowProtection\"));\n"
     "            DlssNrGameExposureTrimAnchors.set_from_config(readString(\"DlssNr\", \"GameExposureTrimAnchors\"));\n",
-    "read auto exposure fallback",
+    "read auto exposure shadow protection",
 )
 s = replace_once(
     s,
@@ -66,15 +72,15 @@ s = replace_once(
     "    ini.SetValue(\"DlssNr\", \"GameExposureTrimAnchors\",\n",
     "    ini.SetValue(\"DlssNr\", \"AutoExposureTrim\",\n"
     "                 GetFloatValue(Instance()->DlssNrAutoExposureTrim.value_for_config()).c_str());\n"
-    "    ini.SetValue(\"DlssNr\", \"AutoExposureSimpleAverageFallback\",\n"
-    "                 GetBoolValue(Instance()->DlssNrAutoExposureSimpleAverageFallback.value_for_config()).c_str());\n"
+    "    ini.SetValue(\"DlssNr\", \"AutoExposureShadowProtection\",\n"
+    "                 GetFloatValue(Instance()->DlssNrAutoExposureShadowProtection.value_for_config()).c_str());\n"
     "    ini.SetValue(\"DlssNr\", \"GameExposureTrimAnchors\",\n",
-    "write auto exposure fallback",
+    "write auto exposure shadow protection",
 )
 write(rel, s)
 
 # -----------------------------------------------------------------------------
-# Menu: emergency fallback checkbox + Trim range 0.25x..50x for game and auto.
+# Menu: shadow-protection slider + Trim range 0.25x..50x for game and auto.
 # -----------------------------------------------------------------------------
 rel = "OptiScaler/dlssnr/DlssNr_Menu.cpp"
 s = read(rel)
@@ -82,26 +88,23 @@ s = replace_once(
     s,
     "            const auto autoStatus = DlssNr::AutoExposureStatus();\n"
     "            RenderExposureTrimAnchorControls(config->DlssNrAutoExposureTrimAnchors,\n",
-    "            bool simpleAverageFallback =\n"
-    "                config->DlssNrAutoExposureSimpleAverageFallback.value_or_default();\n"
-    "            if (ImGui::Checkbox(\"Calculate the exposure using simple average (emergency fallback)\",\n"
-    "                                &simpleAverageFallback))\n"
-    "                config->DlssNrAutoExposureSimpleAverageFallback = simpleAverageFallback;\n\n"
-    "            HelpMarker(\"Normally Automatic exposure uses a stable highlight-compressed arithmetic average.\"\n"
-    "                       \"\\nEvery 64x64 tile remains part of the meter. A full-frame log-luminance mean\"\n"
-    "                       \"\\nis used only as a smooth brightness reference. Values up to 2 stops above\"\n"
-    "                       \"\\nthat reference pass unchanged; brighter values are smoothly compressed,\"\n"
-    "                       \"\\nnot removed. The final luminance is still a linear arithmetic mean and the\"\n"
-    "                       \"\\noriginal exposure formula is unchanged. This avoids hard histogram-boundary\"\n"
-    "                       \"\\njumps while limiting small extreme HDR highlights.\"\n"
-    "                       \"\\n\\nEnable this only as an emergency compatibility fallback. It restores the\"\n"
-    "                       \"\\nprevious arithmetic mean of the entire frame.\");\n\n"
-    "            ImGui::TextDisabled(simpleAverageFallback\n"
-    "                                    ? \"Metering: full-frame arithmetic average (emergency fallback).\"\n"
-    "                                    : \"Metering: stable highlight-compressed arithmetic average.\");\n\n"
+    "            float shadowProtection =\n"
+    "                config->DlssNrAutoExposureShadowProtection.value_or_default();\n"
+    "            if (ImGui::SliderFloat(\"Shadow protection from bright highlights\", &shadowProtection,\n"
+    "                                   0.0f, 100.0f, \"%.0f%%\"))\n"
+    "                config->DlssNrAutoExposureShadowProtection = shadowProtection;\n\n"
+    "            HelpMarker(\"Controls how strongly very bright highlights are prevented from driving\"\n"
+    "                       \"\\nAutomatic exposure upward and raising White Point over darker scene areas.\"\n"
+    "                       \"\\nEvery 64x64 tile remains part of the meter; highlights are compressed,\"\n"
+    "                       \"\\nnot removed. The final luminance remains a pixel-area-weighted linear\"\n"
+    "                       \"\\narithmetic mean and the original exposure formula is unchanged.\"\n"
+    "                       \"\\n\\n0%: original full-frame arithmetic average (knee +3 EV, slope 1.00).\"\n"
+    "                       \"\\n100%: strongest protection (knee +1 EV, slope 0.35).\"\n"
+    "                       \"\\nIntermediate values linearly interpolate both the knee and slope.\");\n\n"
+    "            ImGui::TextDisabled(\"Metering: highlight-compressed arithmetic average.\");\n\n"
     "            const auto autoStatus = DlssNr::AutoExposureStatus();\n"
     "            RenderExposureTrimAnchorControls(config->DlssNrAutoExposureTrimAnchors,\n",
-    "automatic exposure fallback checkbox",
+    "automatic exposure shadow protection slider",
 )
 
 range_count = s.count("0.25f, 10.0f")
@@ -115,7 +118,7 @@ s = s.replace("Range: 0.25x to 10.00x.", "Range: 0.25x to 50.00x.")
 write(rel, s)
 
 # -----------------------------------------------------------------------------
-# Constant-buffer switch, C++ dispatch value and 50x runtime Trim range.
+# Constant-buffer strength, C++ dispatch value and 50x runtime Trim range.
 # -----------------------------------------------------------------------------
 rel = "OptiScaler/shaders/dlssnr/DlssNr_Common.h"
 s = read(rel)
@@ -126,9 +129,9 @@ s = replace_once(
     "};\n",
     "    float ExposureTrimAnchorExposure7;\n"
     "    float ExposureTrimAnchorTrim7;\n"
-    "    uint32_t AutoExposureSimpleAverageFallback;\n"
+    "    float AutoExposureShadowProtection;\n"
     "};\n",
-    "automatic exposure fallback constant",
+    "automatic exposure shadow protection constant",
 )
 write(rel, s)
 
@@ -139,10 +142,10 @@ s = replace_once(
     "        exposureParams.PreExposure = frame.PreExposure;\n"
     "        const D3D12_RESOURCE_DESC exposureSourceDesc = source->GetDesc();\n",
     "        exposureParams.PreExposure = frame.PreExposure;\n"
-    "        exposureParams.AutoExposureSimpleAverageFallback =\n"
-    "            cfg.DlssNrAutoExposureSimpleAverageFallback.value_or_default() ? 1u : 0u;\n"
+    "        exposureParams.AutoExposureShadowProtection =\n"
+    "            std::clamp(cfg.DlssNrAutoExposureShadowProtection.value_or_default(), 0.0f, 100.0f);\n"
     "        const D3D12_RESOURCE_DESC exposureSourceDesc = source->GetDesc();\n",
-    "automatic exposure fallback dispatch constant",
+    "automatic exposure shadow protection dispatch constant",
 )
 runtime_range_count = s.count("0.25f, 10.0f")
 if runtime_range_count != 4:
@@ -151,11 +154,11 @@ s = s.replace("0.25f, 10.0f", "0.25f, 50.0f")
 write(rel, s)
 
 # -----------------------------------------------------------------------------
-# HLSL: stable soft highlight compression. All tiles remain in the final LINEAR
-# arithmetic mean. A full-frame mean in log2 luminance is used only as a smooth
-# reference. Above +2 EV from that reference, additional brightness grows at 35%
-# of its original rate in EV. No histogram or hard membership boundaries remain.
-# The fallback branch preserves the previous full-frame arithmetic average exactly.
+# HLSL: user-controlled soft highlight compression. All tiles remain in the final
+# LINEAR arithmetic mean. A full-frame mean in log2 luminance is used only as a
+# smooth reference. The 0..100% slider maps linearly from knee +3 EV / slope 1.00
+# to knee +1 EV / slope 0.35. At exactly 0%, use the exact old arithmetic-average
+# path so the slider fully replaces the former emergency-fallback checkbox.
 # -----------------------------------------------------------------------------
 rel = "OptiScaler/shaders/dlssnr/precompile/dlssnr.hlsl"
 s = read(rel)
@@ -166,9 +169,9 @@ s = replace_once(
     "};\n",
     "    float gExposureTrimAnchorExposure7;\n"
     "    float gExposureTrimAnchorTrim7;\n"
-    "    uint  gAutoExposureSimpleAverageFallback;\n"
+    "    float gAutoExposureShadowProtection;\n"
     "};\n",
-    "HLSL automatic exposure fallback constant",
+    "HLSL automatic exposure shadow protection constant",
 )
 
 hlsl_range_count = s.count("0.25, 10.0")
@@ -184,11 +187,11 @@ if s.find("    if (gMode == 5)\n    {\n", auto_start + 1) >= 0:
     raise RuntimeError("automatic exposure HLSL block appears more than once")
 
 new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-average exposure math, but make
-    // small extreme HDR highlights less dominant without ever dropping tiles from the meter.
-    // A full-frame log2-luminance mean is used only as a continuous reference. Up to +2 EV above
-    // that reference luminance passes unchanged. Beyond the knee, extra brightness grows at 35%
-    // of its original rate in EV. This is continuous in camera motion and has no histogram-bin or
-    // percentile-boundary switches. The emergency flag restores the old full-frame mean exactly.
+    // bright HDR highlights progressively less dominant according to the user-controlled protection.
+    // 0% is the exact old full-frame arithmetic average. 100% starts soft compression at +1 EV
+    // above the smooth log-luminance reference, with additional brightness growing at 35% of its
+    // original EV rate. Intermediate values linearly interpolate knee (+3 -> +1 EV) and slope
+    // (1.00 -> 0.35). No tiles are removed and there are no histogram/percentile boundary switches.
     if (gMode == 5)
     {
         if (id.x != 0 || id.y != 0)
@@ -198,13 +201,14 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
         const uint srcH = max(gExposureSourceHeight, 1u);
         const float preExposure =
             (isfinite(gPreExposure) && gPreExposure > 1e-6) ? gPreExposure : 1.0;
+        const float protection = saturate(gAutoExposureShadowProtection * 0.01);
 
         float weightedBufferLuma = 0.0;
         float weightedSceneLogLuma = 0.0;
         float totalPixels = 0.0;
 
-        // First pass: preserve the exact old full-frame arithmetic accumulator for fallback and,
-        // for the protected path, obtain a smooth full-frame log-luminance reference.
+        // First pass: always preserve the exact old arithmetic accumulator. The log-domain
+        // reference is only needed when protection is above zero.
         [loop] for (uint ty = 0u; ty < 64u; ++ty)
         {
             const uint y0 = (ty * srcH) / 64u;
@@ -222,7 +226,7 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
                 weightedBufferLuma += tileMean * pixels;
                 totalPixels += pixels;
 
-                if (gAutoExposureSimpleAverageFallback == 0u)
+                if (protection > 0.0)
                 {
                     const float sceneLuma = max(tileMean / preExposure, 1e-8);
                     const float logLuma = clamp(log2(sceneLuma), -24.0, 24.0);
@@ -235,15 +239,15 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
         const float simpleAverageSceneLuma = averageBufferLuma / preExposure;
         float meteredSceneLuma = simpleAverageSceneLuma;
 
-        if (gAutoExposureSimpleAverageFallback == 0u && totalPixels > 0.0)
+        if (protection > 0.0 && totalPixels > 0.0)
         {
             const float referenceLogLuma = weightedSceneLogLuma / totalPixels;
-            const float highlightKneeEv = 2.0;
-            const float highlightCompressionSlope = 0.35;
+            const float highlightKneeEv = lerp(3.0, 1.0, protection);
+            const float highlightCompressionSlope = lerp(1.0, 0.35, protection);
             float protectedLinearSum = 0.0;
 
-            // Second pass: every tile contributes by its real pixel area. Only the luminance value
-            // of strong bright outliers is softly compressed; there is no hard selection step.
+            // Second pass: every tile contributes by real pixel area. Only strong bright values
+            // above the interpolated knee are softly compressed.
             [loop] for (uint protectedTy = 0u; protectedTy < 64u; ++protectedTy)
             {
                 const uint y0 = (protectedTy * srcH) / 64u;
@@ -279,8 +283,7 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
                 meteredSceneLuma = protectedAverageSceneLuma;
         }
 
-        // Keep the original NVIDIA-style exposure formula unchanged. Only extreme bright outlier
-        // contributions to the arithmetic mean above are compressed in the default meter.
+        // Keep the original NVIDIA-style exposure formula unchanged.
         float exposure = meteredSceneLuma > 1e-8
             ? 0.18 / (meteredSceneLuma * 0.82)
             : 1.0;
@@ -296,4 +299,4 @@ new_auto = r'''    // Automatic exposure. Keep the original linear arithmetic-av
 s = s[:auto_start] + new_auto + s[auto_end:]
 write(rel, s)
 
-print("DLSS-NR stable highlight-compressed Automatic exposure + 50x Trim patch applied")
+print("DLSS-NR shadow-protection slider Automatic exposure + 50x Trim patch applied")
