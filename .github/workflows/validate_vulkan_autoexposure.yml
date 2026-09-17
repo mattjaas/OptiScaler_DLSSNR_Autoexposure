@@ -26,6 +26,7 @@ jobs:
           python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
           python -m py_compile .\tools\apply_dlssnr_whitepoint_trim_axis.py
           python -m py_compile .\tools\apply_dlssnr_highlight_protected_autoexposure.py
+          python -m py_compile .\tools\apply_dlssnr_vulkan_trim_range.py
           python -m py_compile .\tools\apply_dlssnr_vulkan_autoexposure.py
           python -m py_compile .\tools\embed_dlssnr_spirv.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -39,6 +40,8 @@ jobs:
           python .\tools\apply_dlssnr_whitepoint_trim_axis.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_highlight_protected_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_vulkan_trim_range.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_vulkan_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -55,6 +58,7 @@ jobs:
               $vk -notmatch 'AutoExposureStatusVk' -or
               $vk -notmatch 'FillAutoExposureTrimConstantsVk' -or
               $vk -notmatch 'kMeterSide = 64' -or
+              $vk -notmatch '0\.25f, 50\.0f' -or
               $vkh -notmatch 'AutoExposureStatusVk' -or
               $fwd -notmatch 'ExposureTexture' -or
               $menu -notmatch 'AutoExposureStatusVk' -or
