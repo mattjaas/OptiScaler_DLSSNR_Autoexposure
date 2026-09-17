@@ -61,15 +61,15 @@ jobs:
 
           if ($dx12 -notmatch 'automaticExposureSelected' -or
               $dx12 -notmatch 'DlssNrAutoExposureTrim\.value_or_default\(\), 0\.25f, 50\.0f' -or
-              $dx12 -notmatch 'DlssNrAutoExposureSimpleAverageFallback' -or
+              $dx12 -notmatch 'DlssNrAutoExposureShadowProtection' -or
               $dx12 -notmatch 'AutoExposureStatus' -or
               $dx12 -notmatch 'ExposureTrimForRuntime' -or
               $dx12 -notmatch 'baseWhitePoint = g_nr\.gamePreExposure / g_nr\.gameExposure' -or
               $menu -notmatch 'Automatic exposure' -or
               $menu -notmatch 'Trim \(x automatic exposure\).*50\.0f' -or
-              $menu -notmatch 'Calculate the exposure using simple average \(emergency fallback\)' -or
-              $menu -notmatch 'stable highlight-compressed arithmetic average' -or
-              $menu -notmatch 'Values up to 2 stops above' -or
+              $menu -notmatch 'Shadow protection from bright highlights' -or
+              $menu -notmatch '0%: original full-frame arithmetic average' -or
+              $menu -notmatch '100%: strongest protection' -or
               $menu -notmatch 'Preview Trim value for actual scene' -or
               $menu -notmatch 'Add Anchor point' -or
               $menu -notmatch 'Current base white point' -or
@@ -78,10 +78,10 @@ jobs:
               $hlsl -notmatch 'EffectiveExposureTrim' -or
               $hlsl -notmatch 'InterpolateExposureTrimSegment' -or
               $hlsl -notmatch 'baseWhitePoint = preExposure / exposure' -or
-              $hlsl -notmatch 'gAutoExposureSimpleAverageFallback' -or
+              $hlsl -notmatch 'gAutoExposureShadowProtection' -or
               $hlsl -notmatch 'weightedSceneLogLuma' -or
-              $hlsl -notmatch 'highlightKneeEv = 2\.0' -or
-              $hlsl -notmatch 'highlightCompressionSlope = 0\.35' -or
+              $hlsl -notmatch 'highlightKneeEv = lerp\(3\.0, 1\.0, protection\)' -or
+              $hlsl -notmatch 'highlightCompressionSlope = lerp\(1\.0, 0\.35, protection\)' -or
               $hlsl -notmatch 'compressedSceneLuma' -or
               $hlsl -notmatch '0\.18 / \(meteredSceneLuma \* 0\.82\)' -or
               $hlsl -notmatch 'gExposureTrimAnchorCount') {
@@ -192,7 +192,7 @@ jobs:
           - Automatic exposure: always calculates exposure on GPU from original linear HDR, ignores game ExposureTexture, trim up to 50x;
           - A buffer the scan found: calibrated scan path; meter and anchors appear only for this source.
 
-          Automatic exposure keeps the original arithmetic-average exposure formula. By default every tile remains in the meter. A full-frame log-luminance mean is used only as a smooth reference; luminance up to +2 EV above that reference is unchanged, while brighter outliers are compressed so further brightness grows at 35% of its original EV rate. The final metered luminance remains a pixel-area-weighted linear arithmetic mean, with no histogram-bin or percentile-boundary selection. The "Calculate the exposure using simple average (emergency fallback)" checkbox restores the previous arithmetic average of the entire frame.
+          Automatic exposure keeps the original arithmetic-average exposure formula and exposes a "Shadow protection from bright highlights" slider, default 100%. At 0% it uses the exact original full-frame arithmetic average. At 100%, highlight compression starts at +1 EV above the smooth full-frame log-luminance reference and additional brightness grows at 35% of its original EV rate. Intermediate slider values linearly interpolate the knee from +3 to +1 EV and the slope from 1.00 to 0.35. Every tile remains in the meter; the final metered luminance remains a pixel-area-weighted linear arithmetic mean with no histogram-bin or percentile-boundary selection.
 
           Game exposure and Automatic exposure support Base White Point-dependent Trim Anchor points. Each point stores the untrimmed Base White Point (PreExposure / Exposure) and the selected Trim. With no points the Trim slider is used, one point fixes Trim for the whole range, and multiple points are interpolated logarithmically between Base White Point values. The Preview Trim value for actual scene option temporarily bypasses anchors while calibrating a new point.
 
