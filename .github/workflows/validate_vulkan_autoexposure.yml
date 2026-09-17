@@ -1,0 +1,104 @@
+name: Validate Vulkan auto exposure
+
+on:
+  push:
+    branches:
+      - dlss-neural-rendering
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Apply release patches
+        shell: powershell
+        run: |
+          python -m py_compile .\tools\apply_dlssnr_autoexposure.py
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_anchors.py
+          python -m py_compile .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          python -m py_compile .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          python -m py_compile .\tools\apply_dlssnr_highlight_protected_autoexposure.py
+          python -m py_compile .\tools\apply_dlssnr_vulkan_autoexposure.py
+          python -m py_compile .\tools\embed_dlssnr_spirv.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_exposure_trim_anchors.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_exposure_trim_fxc_fix.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_whitepoint_trim_axis.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_highlight_protected_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_vulkan_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $vk = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNrFeature_Vk.cpp" -Raw
+          $vkh = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNrFeature_Vk.h" -Raw
+          $fwd = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\forwarder\dlssnr_forwarder.cpp" -Raw
+          $menu = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
+          $hlsl = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl" -Raw
+
+          if ($vk -notmatch 'DlssNrMode_AutoExposure' -or
+              $vk -notmatch 'AutoExposureShadowProtection' -or
+              $vk -notmatch 'autoExposure\.view' -or
+              $vk -notmatch 'AutoExposureStatusVk' -or
+              $vk -notmatch 'FillAutoExposureTrimConstantsVk' -or
+              $vk -notmatch 'kMeterSide = 64' -or
+              $vkh -notmatch 'AutoExposureStatusVk' -or
+              $fwd -notmatch 'ExposureTexture' -or
+              $menu -notmatch 'AutoExposureStatusVk' -or
+              $menu -match 'Automatic exposure is currently available on D3D12 only' -or
+              $hlsl -notmatch 'gMotion\.Load\(int3\(0, 0, 0\)\)\.r' -or
+              $hlsl -notmatch 'highlightKneeEv = lerp\(3\.0, 1\.0, protection\)' -or
+              $hlsl -notmatch '0\.18 / \(meteredSceneLuma \* 0\.82\)') {
+            Write-Error "Expected Vulkan automatic-exposure markers are missing."
+            exit 1
+          }
+
+      - name: Compile D3D12 shader with FXC
+        shell: powershell
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { Write-Error "fxc.exe not found"; exit 1 }
+          $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
+          & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Compile Vulkan shader with DXC
+        shell: powershell
+        run: |
+          $dxcCmd = Get-Command dxc.exe -ErrorAction SilentlyContinue
+          $dxc = if ($dxcCmd) { $dxcCmd.Source } else { $null }
+          if (-not $dxc) {
+            $candidate = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\dxc.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($candidate) { $dxc = $candidate.FullName }
+          }
+          if (-not $dxc) { Write-Error "dxc.exe not found"; exit 1 }
+          Write-Host "Using DXC: $dxc"
+          $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
+          & $dxc -spirv -T cs_6_0 -E CSMain -D VK_MODE=1 -fvk-use-dx-layout -fspv-target-env=vulkan1.1 -O3 -Fo "$dir\DlssNr_Shader.spv" "$dir\dlssnr.hlsl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\embed_dlssnr_spirv.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build Release x64
+        shell: powershell
+        run: |
+          msbuild /m /p:Configuration=Release . /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
