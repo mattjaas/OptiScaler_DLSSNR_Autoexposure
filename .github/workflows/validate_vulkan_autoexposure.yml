@@ -80,20 +80,21 @@ jobs:
           & $fxc.FullName /nologo /T cs_5_0 /E CSMain /O3 /Fo "$dir\DlssNr_Shader.cso" /Fh "$dir\DlssNr_Shader.h" /Vn DlssNr_cso "$dir\dlssnr.hlsl"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Compile Vulkan shader with DXC
+      - name: Compile Vulkan shader with official DXC
         shell: powershell
         run: |
-          $dxcCmd = Get-Command dxc.exe -ErrorAction SilentlyContinue
-          $dxc = if ($dxcCmd) { $dxcCmd.Source } else { $null }
-          if (-not $dxc) {
-            $candidate = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\dxc.exe" -ErrorAction SilentlyContinue |
-              Sort-Object FullName -Descending | Select-Object -First 1
-            if ($candidate) { $dxc = $candidate.FullName }
-          }
-          if (-not $dxc) { Write-Error "dxc.exe not found"; exit 1 }
-          Write-Host "Using DXC: $dxc"
+          $zip = Join-Path $env:RUNNER_TEMP "dxc_2026_07_29.zip"
+          $dxcRoot = Join-Path $env:RUNNER_TEMP "dxc_spirv"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2607/dxc_2026_07_29.zip" -OutFile $zip
+          $actualHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = "a1dfb116ba3eeae6a1582291b53a8e7bf65ad760676bd3194685c8f7367cd241"
+          if ($actualHash -ne $expectedHash) { Write-Error "DXC archive SHA256 mismatch"; exit 1 }
+          Expand-Archive -Path $zip -DestinationPath $dxcRoot -Force
+          $dxc = Get-ChildItem $dxcRoot -Recurse -Filter dxc.exe | Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $dxc) { Write-Error "Official SPIR-V-capable dxc.exe not found after extraction"; exit 1 }
+          Write-Host "Using DXC: $($dxc.FullName)"
           $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
-          & $dxc -spirv -T cs_6_0 -E CSMain -D VK_MODE=1 -fvk-use-dx-layout -fspv-target-env=vulkan1.1 -O3 -Fo "$dir\DlssNr_Shader.spv" "$dir\dlssnr.hlsl"
+          & $dxc.FullName -spirv -T cs_6_0 -E CSMain -D VK_MODE=1 -fvk-use-dx-layout -fspv-target-env=vulkan1.1 -O3 -Fo "$dir\DlssNr_Shader.spv" "$dir\dlssnr.hlsl"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\embed_dlssnr_spirv.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
