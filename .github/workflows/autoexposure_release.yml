@@ -38,6 +38,18 @@ jobs:
           python -m py_compile .\tools\apply_dlssnr_highlight_protected_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          python -m py_compile .\tools\apply_dlssnr_vulkan_trim_range.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python -m py_compile .\tools\apply_dlssnr_vulkan_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python -m py_compile .\tools\apply_dlssnr_vulkan_autoexposure_safety.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python -m py_compile .\tools\embed_dlssnr_spirv.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python .\tools\apply_dlssnr_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -53,8 +65,21 @@ jobs:
           python .\tools\apply_dlssnr_highlight_protected_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # Structural checks before spending time on FXC/MSBuild.
+          python .\tools\apply_dlssnr_vulkan_trim_range.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_vulkan_autoexposure.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\apply_dlssnr_vulkan_autoexposure_safety.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Structural checks before spending time on FXC/DXC/MSBuild.
           $dx12 = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Dx12.cpp" -Raw
+          $vk = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNrFeature_Vk.cpp" -Raw
+          $vkh = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNrFeature_Vk.h" -Raw
+          $shaderVk = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Vk.h" -Raw
+          $fwd = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\forwarder\dlssnr_forwarder.cpp" -Raw
           $menu = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
           $scan = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_ExposureScan.cpp" -Raw
           $hlsl = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl" -Raw
@@ -65,6 +90,18 @@ jobs:
               $dx12 -notmatch 'AutoExposureStatus' -or
               $dx12 -notmatch 'ExposureTrimForRuntime' -or
               $dx12 -notmatch 'baseWhitePoint = g_nr\.gamePreExposure / g_nr\.gameExposure' -or
+              $vk -notmatch 'DlssNrMode_AutoExposure' -or
+              $vk -notmatch 'AutoExposureShadowProtection' -or
+              $vk -notmatch 'autoExposure\.view' -or
+              $vk -notmatch 'AutoExposureStatusVk' -or
+              $vk -notmatch 'FillAutoExposureTrimConstantsVk' -or
+              $vk -notmatch 'kMeterSide = 64' -or
+              $vk -notmatch '0\.25f, 50\.0f' -or
+              $vk -notmatch 'modelExposure = usingAutoExposure \? &g_vk\.autoExposure\.ngx : nullptr' -or
+              $vk -match 'modelExposure = exposure' -or
+              $vkh -notmatch 'AutoExposureStatusVk' -or
+              $shaderVk -notmatch 'kSlotsPerFrame = 8' -or
+              $fwd -notmatch 'ExposureTexture' -or
               $menu -notmatch 'Automatic exposure' -or
               $menu -notmatch 'Trim \(x automatic exposure\).*50\.0f' -or
               $menu -notmatch 'Shadow protection from bright highlights' -or
@@ -73,6 +110,8 @@ jobs:
               $menu -notmatch 'Preview Trim value for actual scene' -or
               $menu -notmatch 'Add Anchor point' -or
               $menu -notmatch 'Current base white point' -or
+              $menu -notmatch 'AutoExposureStatusVk' -or
+              $menu -match 'Automatic exposure is currently available on D3D12 only' -or
               $menu -notmatch 'if \(wpSource == 3\)' -or
               $scan -notmatch 'DlssNrWhitePointSource\.value_or_default\(\) == 3' -or
               $hlsl -notmatch 'EffectiveExposureTrim' -or
@@ -83,9 +122,10 @@ jobs:
               $hlsl -notmatch 'highlightKneeEv = lerp\(3\.0, 1\.0, protection\)' -or
               $hlsl -notmatch 'highlightCompressionSlope = lerp\(1\.0, 0\.35, protection\)' -or
               $hlsl -notmatch 'compressedSceneLuma' -or
+              $hlsl -notmatch 'gMotion\.Load\(int3\(0, 0, 0\)\)\.r' -or
               $hlsl -notmatch '0\.18 / \(meteredSceneLuma \* 0\.82\)' -or
               $hlsl -notmatch 'gExposureTrimAnchorCount') {
-            Write-Error "Patch completed but expected Auto Exposure / Trim Anchor markers are missing."
+            Write-Error "Patch completed but expected D3D12/Vulkan Auto Exposure / Trim Anchor markers are missing."
             exit 1
           }
 
@@ -119,6 +159,53 @@ jobs:
 
           if (-not (Test-Path "$dir\DlssNr_Shader.h")) {
             Write-Error "FXC did not generate DlssNr_Shader.h"
+            exit 1
+          }
+
+      - name: Compile DLSS-NR Vulkan shader with official DXC
+        shell: powershell
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "dxc_2026_07_29.zip"
+          $dxcRoot = Join-Path $env:RUNNER_TEMP "dxc_spirv"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2607/dxc_2026_07_29.zip" -OutFile $zip
+
+          $actualHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedHash = "a1dfb116ba3eeae6a1582291b53a8e7bf65ad760676bd3194685c8f7367cd241"
+          if ($actualHash -ne $expectedHash) {
+            Write-Error "DXC archive SHA256 mismatch"
+            exit 1
+          }
+
+          Expand-Archive -Path $zip -DestinationPath $dxcRoot -Force
+          $dxc = Get-ChildItem $dxcRoot -Recurse -Filter dxc.exe |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]' } |
+            Select-Object -First 1
+
+          if (-not $dxc) {
+            Write-Error "Official SPIR-V-capable dxc.exe not found after extraction"
+            exit 1
+          }
+
+          Write-Host "Using DXC: $($dxc.FullName)"
+          $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
+
+          & $dxc.FullName `
+            -spirv `
+            -T cs_6_0 `
+            -E CSMain `
+            -D VK_MODE=1 `
+            -fvk-use-dx-layout `
+            -O3 `
+            -Fo "$dir\DlssNr_Shader.spv" `
+            "$dir\dlssnr.hlsl"
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python .\tools\embed_dlssnr_spirv.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path "$dir\DlssNr_Shader_Vk.h")) {
+            Write-Error "DXC/embed step did not generate DlssNr_Shader_Vk.h"
             exit 1
           }
 
@@ -189,14 +276,14 @@ jobs:
           White point sources:
           - Paper white only;
           - The game's own exposure: uses only the game's ExposureTexture, trim up to 50x;
-          - Automatic exposure: always calculates exposure on GPU from original linear HDR, ignores game ExposureTexture, trim up to 50x;
+          - Automatic exposure: calculates exposure on GPU from original linear HDR on D3D12 and native Vulkan, ignores game ExposureTexture, trim up to 50x;
           - A buffer the scan found: calibrated scan path; meter and anchors appear only for this source.
 
           Automatic exposure keeps the original arithmetic-average exposure formula and exposes a "Shadow protection from bright highlights" slider, default 100%. At 0% it uses the exact original full-frame arithmetic average. At 100%, highlight compression starts at +1 EV above the smooth full-frame log-luminance reference and additional brightness grows at 35% of its original EV rate. Intermediate slider values linearly interpolate the knee from +3 to +1 EV and the slope from 1.00 to 0.35. Every tile remains in the meter; the final metered luminance remains a pixel-area-weighted linear arithmetic mean with no histogram-bin or percentile-boundary selection.
 
           Game exposure and Automatic exposure support Base White Point-dependent Trim Anchor points. Each point stores the untrimmed Base White Point (PreExposure / Exposure) and the selected Trim. With no points the Trim slider is used, one point fixes Trim for the whole range, and multiple points are interpolated logarithmically between Base White Point values. The Preview Trim value for actual scene option temporarily bypasses anchors while calibrating a new point.
 
-          Automatic exposure is calculated once before Encode and the same 1x1 value is reused by Encode, all NR passes and Resolve. Its Trim anchors are evaluated against the same-frame Base White Point in the shader; the CPU readback is only for the menu and Anchor-point capture.
+          On both D3D12 and Vulkan, Automatic exposure is calculated once before Encode and the same 1x1 GPU value is reused by Encode, the Neural Rendering model and Resolve. Its Trim anchors are evaluated against the same-frame Base White Point on GPU; the CPU readback is only for menu/status and Anchor-point capture.
 
           This workflow never commits patched sources back to the branch and does not use actions/upload-artifact.
           "@
