@@ -102,6 +102,49 @@ menu, auto_count = auto_pattern.subn(auto_replacement, menu, count=1)
 if auto_count != 1:
     raise RuntimeError(f"Vulkan automatic anchor controls: expected exactly one match, got {auto_count}")
 
+old_game_help = (
+    "            HelpMarker(\"Multiplier on the white point derived from the game's own ExposureTexture.\"\n"
+    "                       \"\\n\\n1.00x uses the game's value unchanged. Range: 0.25x to 50.00x.\"\n"
+    "                       \"\\n\\nThis source never switches to OptiScaler automatic exposure. If the game\"\n"
+    "                       \"\\ndoes not supply ExposureTexture, the status above reports that this source\"\n"
+    "                       \"\\nis unavailable.\");\n"
+)
+new_game_help = (
+    "            HelpMarker(\"Multiplier on the white point derived from the game's own ExposureTexture.\"\n"
+    "                       \"\\n\\n1.00x uses the game's value unchanged. Range: 0.25x to 50.00x.\"\n"
+    "                       \"\\n\\nTip: Try to set this to the highest value that subjectively looks best. \"\n"
+    "                       \"Excessive values will degrade image quality. If you notice differences in how \"\n"
+    "                       \"dark and bright scenes appear, you can use anchor points to set different Trim \"\n"
+    "                       \"values for each.\"\n"
+    "                       \"\\n\\nIf the game does not supply ExposureTexture, the status above reports that \"\n"
+    "                       \"this source is unavailable.\");\n"
+)
+if menu.count(old_game_help) != 1:
+    raise RuntimeError(f"game Trim help text: expected exactly one match, got {menu.count(old_game_help)}")
+menu = menu.replace(old_game_help, new_game_help, 1)
+
+old_auto_help = (
+    "            HelpMarker(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame\"\n"
+    "                       \"\\nbefore Neural Rendering changes it.\"\n"
+    "                       \"\\n\\nThis source always uses OptiScaler's calculation: the game's ExposureTexture\"\n"
+    "                       \"\\nis ignored even when present. One 1x1 exposure value is calculated on the GPU\"\n"
+    "                       \"\\nand reused by Encode, every Neural Rendering pass, and Resolve.\"\n"
+    "                       \"\\n\\n1.00x uses the calculated value unchanged. Range: 0.25x to 50.00x.\"\n"
+    "                       \"\\nAutomatic exposure is currently D3D12 only.\");\n"
+)
+new_auto_help = (
+    "            HelpMarker(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame.\"\n"
+    "                       \"\\nThe game's ExposureTexture is ignored even when present.\"\n"
+    "                       \"\\n\\n1.00x uses the calculated value unchanged. Range: 0.25x to 50.00x.\"\n"
+    "                       \"\\n\\nTip: Try to set this to the highest value that subjectively looks best. \"\n"
+    "                       \"Excessive values will degrade image quality. If you notice differences in how \"\n"
+    "                       \"dark and bright scenes appear, you can use anchor points to set different Trim \"\n"
+    "                       \"values for each.\");\n"
+)
+if menu.count(old_auto_help) != 1:
+    raise RuntimeError(f"automatic Trim help text: expected exactly one match, got {menu.count(old_auto_help)}")
+menu = menu.replace(old_auto_help, new_auto_help, 1)
+
 menu_path.write_text(menu, encoding="utf-8", newline="\n")
 
 print("DLSS-NR Vulkan automatic exposure safety adjustments applied")
