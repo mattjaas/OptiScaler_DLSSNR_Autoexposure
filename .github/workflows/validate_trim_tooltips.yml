@@ -39,12 +39,17 @@ jobs:
           }
 
           $menu = Get-Content ".\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
-          if ($menu -notmatch [regex]::Escape("Tip: Try to set this to the highest value that subjectively looks best.")) {
-            Write-Error "Expected Trim tooltip tip text missing"
+          if (($menu -split [regex]::Escape("Tip: Try to set this to the highest value that subjectively looks best.")).Count -ne 3) {
+            Write-Error "Expected the new Tip text in both Trim tooltips"
             exit 1
           }
-          if ($menu -notmatch [regex]::Escape("If the game does not supply ExposureTexture, the status above reports that this source is unavailable.")) {
+          if ($menu -notmatch [regex]::Escape("If the game does not supply ExposureTexture, the status above reports that ") -or
+              $menu -notmatch [regex]::Escape("this source is unavailable.")) {
             Write-Error "Expected game-exposure tooltip ending missing"
+            exit 1
+          }
+          if ($menu -notmatch [regex]::Escape("The game's ExposureTexture is ignored even when present.")) {
+            Write-Error "Expected automatic-exposure tooltip text missing"
             exit 1
           }
           if ($menu -match "Automatic exposure is currently D3D12 only") {
