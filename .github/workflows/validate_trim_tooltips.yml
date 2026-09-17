@@ -1,0 +1,53 @@
+name: Validate Trim tooltips
+
+on:
+  push:
+    branches:
+      - dlss-neural-rendering
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Apply release patches and verify tooltips
+        shell: powershell
+        run: |
+          $scripts = @(
+            ".\tools\apply_dlssnr_autoexposure.py",
+            ".\tools\apply_dlssnr_exposure_trim_anchors.py",
+            ".\tools\apply_dlssnr_exposure_trim_fxc_fix.py",
+            ".\tools\apply_dlssnr_whitepoint_trim_axis.py",
+            ".\tools\apply_dlssnr_highlight_protected_autoexposure.py",
+            ".\tools\apply_dlssnr_vulkan_trim_range.py",
+            ".\tools\apply_dlssnr_vulkan_autoexposure.py",
+            ".\tools\apply_dlssnr_vulkan_autoexposure_safety.py"
+          )
+
+          foreach ($script in $scripts) {
+            python -m py_compile $script
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            python $script
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          $menu = Get-Content ".\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
+          if ($menu -notmatch [regex]::Escape("Tip: Try to set this to the highest value that subjectively looks best.")) {
+            Write-Error "Expected Trim tooltip tip text missing"
+            exit 1
+          }
+          if ($menu -notmatch [regex]::Escape("If the game does not supply ExposureTexture, the status above reports that this source is unavailable.")) {
+            Write-Error "Expected game-exposure tooltip ending missing"
+            exit 1
+          }
+          if ($menu -match "Automatic exposure is currently D3D12 only") {
+            Write-Error "Obsolete D3D12-only tooltip text is still present"
+            exit 1
+          }
