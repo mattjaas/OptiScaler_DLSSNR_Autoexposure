@@ -102,12 +102,12 @@ menu, auto_count = auto_pattern.subn(auto_replacement, menu, count=1)
 if auto_count != 1:
     raise RuntimeError(f"Vulkan automatic anchor controls: expected exactly one match, got {auto_count}")
 
-old_game_help = (
-    "            HelpMarker(\"Multiplier on the white point derived from the game's own ExposureTexture.\"\n"
-    "                       \"\\n\\n1.00x uses the game's value unchanged. Range: 0.25x to 50.00x.\"\n"
-    "                       \"\\n\\nThis source never switches to OptiScaler automatic exposure. If the game\"\n"
-    "                       \"\\ndoes not supply ExposureTexture, the status above reports that this source\"\n"
-    "                       \"\\nis unavailable.\");\n"
+# Tooltip text is matched by the unique HelpMarker prefix rather than by the full old wording.
+# Earlier release-time patches may legitimately reflow or update the body while leaving the control
+# unchanged, so exact whole-block matching is unnecessarily brittle.
+game_help_pattern = re.compile(
+    r"            HelpMarker\(\"Multiplier on the white point derived from the game's own ExposureTexture\.\"\n"
+    r"[\s\S]*?\);\n"
 )
 new_game_help = (
     "            HelpMarker(\"Multiplier on the white point derived from the game's own ExposureTexture.\"\n"
@@ -119,18 +119,13 @@ new_game_help = (
     "                       \"\\n\\nIf the game does not supply ExposureTexture, the status above reports that \"\n"
     "                       \"this source is unavailable.\");\n"
 )
-if menu.count(old_game_help) != 1:
-    raise RuntimeError(f"game Trim help text: expected exactly one match, got {menu.count(old_game_help)}")
-menu = menu.replace(old_game_help, new_game_help, 1)
+menu, game_help_count = game_help_pattern.subn(lambda _: new_game_help, menu, count=1)
+if game_help_count != 1:
+    raise RuntimeError(f"game Trim help text: expected exactly one HelpMarker block, got {game_help_count}")
 
-old_auto_help = (
-    "            HelpMarker(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame\"\n"
-    "                       \"\\nbefore Neural Rendering changes it.\"\n"
-    "                       \"\\n\\nThis source always uses OptiScaler's calculation: the game's ExposureTexture\"\n"
-    "                       \"\\nis ignored even when present. One 1x1 exposure value is calculated on the GPU\"\n"
-    "                       \"\\nand reused by Encode, every Neural Rendering pass, and Resolve.\"\n"
-    "                       \"\\n\\n1.00x uses the calculated value unchanged. Range: 0.25x to 50.00x.\"\n"
-    "                       \"\\nAutomatic exposure is currently D3D12 only.\");\n"
+auto_help_pattern = re.compile(
+    r"            HelpMarker\(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame\.?\"\n"
+    r"[\s\S]*?\);\n"
 )
 new_auto_help = (
     "            HelpMarker(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame.\"\n"
@@ -141,9 +136,9 @@ new_auto_help = (
     "                       \"dark and bright scenes appear, you can use anchor points to set different Trim \"\n"
     "                       \"values for each.\");\n"
 )
-if menu.count(old_auto_help) != 1:
-    raise RuntimeError(f"automatic Trim help text: expected exactly one match, got {menu.count(old_auto_help)}")
-menu = menu.replace(old_auto_help, new_auto_help, 1)
+menu, auto_help_count = auto_help_pattern.subn(lambda _: new_auto_help, menu, count=1)
+if auto_help_count != 1:
+    raise RuntimeError(f"automatic Trim help text: expected exactly one HelpMarker block, got {auto_help_count}")
 
 menu_path.write_text(menu, encoding="utf-8", newline="\n")
 
