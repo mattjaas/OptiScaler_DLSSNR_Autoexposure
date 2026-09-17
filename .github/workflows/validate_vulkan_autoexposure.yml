@@ -101,7 +101,7 @@ jobs:
           if (-not $dxc) { Write-Error "Official SPIR-V-capable dxc.exe not found after extraction"; exit 1 }
           Write-Host "Using DXC: $($dxc.FullName)"
           $dir = "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile"
-          & $dxc.FullName -spirv -T cs_6_0 -E CSMain -D VK_MODE=1 -fvk-use-dx-layout -fspv-target-env=vulkan1.1 -O3 -Fo "$dir\DlssNr_Shader.spv" "$dir\dlssnr.hlsl"
+          & $dxc.FullName -spirv -T cs_6_0 -E CSMain -D VK_MODE=1 -fvk-use-dx-layout "-fspv-target-env=vulkan1.1" -O3 -Fo "$dir\DlssNr_Shader.spv" "$dir\dlssnr.hlsl"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\embed_dlssnr_spirv.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
