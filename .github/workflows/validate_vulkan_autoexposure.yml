@@ -28,6 +28,7 @@ jobs:
           python -m py_compile .\tools\apply_dlssnr_highlight_protected_autoexposure.py
           python -m py_compile .\tools\apply_dlssnr_vulkan_trim_range.py
           python -m py_compile .\tools\apply_dlssnr_vulkan_autoexposure.py
+          python -m py_compile .\tools\apply_dlssnr_vulkan_autoexposure_safety.py
           python -m py_compile .\tools\embed_dlssnr_spirv.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -45,9 +46,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python .\tools\apply_dlssnr_vulkan_autoexposure.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python .\tools\apply_dlssnr_vulkan_autoexposure_safety.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $vk = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNrFeature_Vk.cpp" -Raw
           $vkh = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNrFeature_Vk.h" -Raw
+          $shaderVk = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\DlssNr_Vk.h" -Raw
           $fwd = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\forwarder\dlssnr_forwarder.cpp" -Raw
           $menu = Get-Content "${{ github.workspace }}\OptiScaler\dlssnr\DlssNr_Menu.cpp" -Raw
           $hlsl = Get-Content "${{ github.workspace }}\OptiScaler\shaders\dlssnr\precompile\dlssnr.hlsl" -Raw
@@ -59,6 +63,9 @@ jobs:
               $vk -notmatch 'FillAutoExposureTrimConstantsVk' -or
               $vk -notmatch 'kMeterSide = 64' -or
               $vk -notmatch '0\.25f, 50\.0f' -or
+              $vk -notmatch 'modelExposure = usingAutoExposure \? &g_vk\.autoExposure\.ngx : nullptr' -or
+              $vk -match 'modelExposure = exposure' -or
+              $shaderVk -notmatch 'kSlotsPerFrame = 8' -or
               $vkh -notmatch 'AutoExposureStatusVk' -or
               $fwd -notmatch 'ExposureTexture' -or
               $menu -notmatch 'AutoExposureStatusVk' -or
