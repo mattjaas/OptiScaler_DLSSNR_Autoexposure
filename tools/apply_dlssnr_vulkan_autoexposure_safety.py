@@ -18,6 +18,29 @@ def replace_once(path, old, new, label):
     path.write_text(s.replace(old, new, 1), encoding="utf-8", newline="\n")
 
 
+def replace_help_after_slider(text, slider_label, new_help, label):
+    slider_token = f'ImGui::SliderFloat("{slider_label}"'
+    slider_count = text.count(slider_token)
+    if slider_count != 1:
+        raise RuntimeError(f"{label}: expected exactly one slider, got {slider_count}")
+
+    slider_pos = text.find(slider_token)
+    help_start = text.find("            HelpMarker(", slider_pos)
+    if help_start < 0:
+        raise RuntimeError(f"{label}: HelpMarker after slider was not found")
+
+    next_slider = text.find("ImGui::SliderFloat(", slider_pos + len(slider_token))
+    if next_slider >= 0 and help_start > next_slider:
+        raise RuntimeError(f"{label}: first HelpMarker is not inside the slider block")
+
+    help_end = text.find('");\n', help_start)
+    if help_end < 0:
+        raise RuntimeError(f"{label}: HelpMarker end was not found")
+    help_end += len('");\n')
+
+    return text[:help_start] + new_help + text[help_end:]
+
+
 # Automatic exposure adds two extra compute dispatches before Encode. Give the Vulkan descriptor/
 # constant ring explicit headroom for auto meter + reduce + encode + resolve + optional debug passes.
 replace_once(
@@ -102,13 +125,6 @@ menu, auto_count = auto_pattern.subn(auto_replacement, menu, count=1)
 if auto_count != 1:
     raise RuntimeError(f"Vulkan automatic anchor controls: expected exactly one match, got {auto_count}")
 
-# Tooltip text is matched by the unique HelpMarker prefix rather than by the full old wording.
-# Earlier release-time patches may legitimately reflow or update the body while leaving the control
-# unchanged, so exact whole-block matching is unnecessarily brittle.
-game_help_pattern = re.compile(
-    r"            HelpMarker\(\"Multiplier on the white point derived from the game's own ExposureTexture\.\"\n"
-    r"[\s\S]*?\);\n"
-)
 new_game_help = (
     "            HelpMarker(\"Multiplier on the white point derived from the game's own ExposureTexture.\"\n"
     "                       \"\\n\\n1.00x uses the game's value unchanged. Range: 0.25x to 50.00x.\"\n"
@@ -119,14 +135,13 @@ new_game_help = (
     "                       \"\\n\\nIf the game does not supply ExposureTexture, the status above reports that \"\n"
     "                       \"this source is unavailable.\");\n"
 )
-menu, game_help_count = game_help_pattern.subn(lambda _: new_game_help, menu, count=1)
-if game_help_count != 1:
-    raise RuntimeError(f"game Trim help text: expected exactly one HelpMarker block, got {game_help_count}")
-
-auto_help_pattern = re.compile(
-    r"            HelpMarker\(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame\.?\"\n"
-    r"[\s\S]*?\);\n"
+menu = replace_help_after_slider(
+    menu,
+    "Trim (x the game's exposure)",
+    new_game_help,
+    "game Trim help text",
 )
+
 new_auto_help = (
     "            HelpMarker(\"OptiScaler calculates exposure itself from the ORIGINAL linear-HDR frame.\"\n"
     "                       \"\\nThe game's ExposureTexture is ignored even when present.\"\n"
@@ -136,9 +151,12 @@ new_auto_help = (
     "                       \"dark and bright scenes appear, you can use anchor points to set different Trim \"\n"
     "                       \"values for each.\");\n"
 )
-menu, auto_help_count = auto_help_pattern.subn(lambda _: new_auto_help, menu, count=1)
-if auto_help_count != 1:
-    raise RuntimeError(f"automatic Trim help text: expected exactly one HelpMarker block, got {auto_help_count}")
+menu = replace_help_after_slider(
+    menu,
+    "Trim (x automatic exposure)",
+    new_auto_help,
+    "automatic Trim help text",
+)
 
 menu_path.write_text(menu, encoding="utf-8", newline="\n")
 
