@@ -161,6 +161,7 @@ using PFN_NrEvaluate = int(__cdecl*) (ID3D12GraphicsCommandList*, void*, void*, 
 using PFN_NrRelease = void(__cdecl*) (void*);
 using PFN_NrSetExtras = void(__cdecl*) (void*, float, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
                                         unsigned int, unsigned int, unsigned int, unsigned int);
+using PFN_NrSetExposure = void(__cdecl*) (void*, ID3D12Resource*);
 using PFN_NrSetFloatSlot = void(__cdecl*) (int);
 using PFN_NrProbeFloat = void(__cdecl*) (void*, const char*, float, int);
 
@@ -173,6 +174,7 @@ struct NrState
     PFN_NrEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
     PFN_NrSetExtras setExtras = nullptr;
+    PFN_NrSetExposure setExposure = nullptr;
     PFN_NrSetFloatSlot setFloatSlot = nullptr;
     PFN_NrProbeFloat probeFloat = nullptr;
     bool floatSlotKnown = false;
@@ -278,6 +280,13 @@ struct NrState
     ID3D12Resource* meter = nullptr;
     ID3D12Resource* meterReadback[4] = {};
 
+    ID3D12Resource* autoExposure = nullptr;
+    bool autoExposureReadable = false;
+    float autoExposureValue = 0.0f;
+    float autoExposurePreExposure = 1.0f;
+    unsigned long long autoExposureFrames = 0;
+    uint32_t exposureReadbackSource = 0;
+
     // The calibration grid: what scale the game's buffer is on, measured from the untouched copy.
     // Its own surface and ring rather than sharing the meter's, because the two run at different
     // sizes -- the meter fetches one texel and this reads the whole frame.
@@ -307,7 +316,9 @@ struct NrState
     //
     // The grid is read three frames after it is written, so the flag has to travel with the slot
     // rather than being asked of the current frame.
-    bool meterExposureValid[4] = {};
+    // 0 = none, 1 = game ExposureTexture, 2 = OptiScaler automatic exposure.
+    unsigned int meterExposureKind[4] = {};
+    float meterExposurePreExposure[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     unsigned int meterSlot = 0;
     unsigned long long meterFrames = 0;
 
@@ -555,6 +566,8 @@ bool EnsureForwarder()
     g_nr.release = (PFN_NrRelease) GetProcAddress(g_nr.forwarder, "dlssnr_call_release");
     // Optional: an older forwarder simply lacks it, and the model runs as before.
     g_nr.setExtras = (PFN_NrSetExtras) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_extras");
+    g_nr.setExposure =
+        (PFN_NrSetExposure) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_exposure");
     g_nr.setFloatSlot = (PFN_NrSetFloatSlot) GetProcAddress(g_nr.forwarder, "dlssnr_call_set_float_slot");
     g_nr.probeFloat = (PFN_NrProbeFloat) GetProcAddress(g_nr.forwarder, "dlssnr_call_probe_float");
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
@@ -939,7 +952,7 @@ void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* devic
         return;
 
     // Travels with the grid: read back three frames from now, alongside the tiles it describes.
-    g_nr.meterExposureValid[slot] = exposureBound;
+    g_nr.meterExposureKind[slot] = exposureBound ? 1u : 0u;
 
     D3D12_TEXTURE_COPY_LOCATION src {};
     src.pResource = g_nr.meter;
@@ -961,6 +974,46 @@ void CopyMeterToReadback(ID3D12GraphicsCommandList* cmdList, ID3D12Device* devic
     Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     g_nr.meterFrames++;
+}
+
+void CopyAutoExposureToReadback(ID3D12GraphicsCommandList* cmdList, float preExposure)
+{
+    if (g_nr.autoExposure == nullptr)
+        return;
+
+    const unsigned int slot = (unsigned int) (g_nr.meterFrames % 4);
+    ID3D12Resource* buffer = g_nr.meterReadback[slot];
+
+    if (buffer == nullptr)
+        return;
+
+    g_nr.meterExposureKind[slot] = 2u;
+    g_nr.meterExposurePreExposure[slot] =
+        std::isfinite(preExposure) && preExposure > 1e-6f ? preExposure : 1.0f;
+
+    D3D12_TEXTURE_COPY_LOCATION src {};
+    src.pResource = g_nr.autoExposure;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION dst {};
+    dst.pResource = buffer;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+    dst.PlacedFootprint.Footprint.Width = 1;
+    dst.PlacedFootprint.Footprint.Height = 1;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = kMeterRowBytes;
+
+    Barrier(cmdList, g_nr.autoExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Barrier(cmdList, g_nr.autoExposure, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    g_nr.meterFrames++;
+    g_nr.autoExposureFrames++;
 }
 
 // Takes the game's exposure out of tile 0 of the grid recorded three frames ago.
@@ -1097,8 +1150,13 @@ void ConsumeMeterReadback()
     //
     // When it is not believed gameExposure keeps its last good value, or stays 0 and lets
     // ResolveWhitePoint fall back to the slider, which is what a game supplying none should get.
-    if (g_nr.meterExposureValid[slot] && std::isfinite(src[0]) && src[0] > 0.0f)
+    if (g_nr.meterExposureKind[slot] == 1u && std::isfinite(src[0]) && src[0] > 0.0f)
         g_nr.gameExposure = src[0];
+    else if (g_nr.meterExposureKind[slot] == 2u && std::isfinite(src[0]) && src[0] > 0.0f)
+    {
+        g_nr.autoExposureValue = src[0];
+        g_nr.autoExposurePreExposure = g_nr.meterExposurePreExposure[slot];
+    }
 
     D3D12_RANGE nothingWritten { 0, 0 };
     buffer->Unmap(0, &nothingWritten);
@@ -1124,13 +1182,109 @@ void ConsumeMeterReadback()
 void InvalidateExposureMeter()
 {
     g_nr.gameExposure = 0.0f;
+    g_nr.autoExposureValue = 0.0f;
+    g_nr.autoExposurePreExposure = 1.0f;
 
-    for (bool& valid : g_nr.meterExposureValid)
-        valid = false;
+    for (unsigned int& kind : g_nr.meterExposureKind)
+        kind = 0u;
 
     // Re-arms the `< 4` guard in ConsumeMeterReadback, so nothing is read back until four frames
     // have genuinely been queued since this point.
     g_nr.meterFrames = 0;
+}
+
+struct ExposureTrimAnchorRuntime
+{
+    float exposure = 0.0f;
+    float trim = 1.0f;
+};
+
+std::vector<ExposureTrimAnchorRuntime> ParseExposureTrimAnchorsRuntime(const std::string& text)
+{
+    std::vector<ExposureTrimAnchorRuntime> out;
+    size_t pos = 0;
+
+    while (pos < text.size() && out.size() < 8)
+    {
+        const size_t semi = text.find(';', pos);
+        const std::string token =
+            text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+        pos = semi == std::string::npos ? text.size() : semi + 1;
+
+        const size_t colon = token.find(':');
+        if (colon == std::string::npos)
+            continue;
+
+        try
+        {
+            const float exposure = std::stof(token.substr(0, colon));
+            const float trim = std::stof(token.substr(colon + 1));
+
+            if (std::isfinite(exposure) && exposure > 1e-8f && std::isfinite(trim) && trim > 0.0f)
+                out.push_back({ exposure, std::clamp(trim, 0.25f, 50.0f) });
+        }
+        catch (...)
+        {
+        }
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const ExposureTrimAnchorRuntime& a, const ExposureTrimAnchorRuntime& b)
+              { return a.exposure < b.exposure; });
+    return out;
+}
+
+float ExposureTrimForRuntime(float exposure, float fallback,
+                             const std::vector<ExposureTrimAnchorRuntime>& anchors, bool preview)
+{
+    fallback = std::clamp(fallback, 0.25f, 50.0f);
+
+    if (preview || anchors.empty() || !(std::isfinite(exposure) && exposure > 1e-8f))
+        return fallback;
+
+    if (anchors.size() == 1)
+        return anchors[0].trim;
+
+    if (exposure <= anchors.front().exposure)
+        return anchors.front().trim;
+    if (exposure >= anchors.back().exposure)
+        return anchors.back().trim;
+
+    for (size_t i = 0; i + 1 < anchors.size(); ++i)
+    {
+        const auto& a = anchors[i];
+        const auto& b = anchors[i + 1];
+
+        if (exposure >= a.exposure && exposure <= b.exposure &&
+            b.exposure > a.exposure * 1.000001f)
+        {
+            const float t = (std::log(exposure) - std::log(a.exposure)) /
+                            (std::log(b.exposure) - std::log(a.exposure));
+            return std::clamp(std::exp(std::log(a.trim) + t * (std::log(b.trim) - std::log(a.trim))),
+                              0.25f, 50.0f);
+        }
+    }
+
+    return anchors.back().trim;
+}
+
+void FillAutoExposureTrimConstants(DlssNrConstants& params, const Config& cfg)
+{
+    params.ExposureTrim =
+        std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 50.0f);
+    params.ExposureTrimPreview = cfg.DlssNrAutoExposureTrimPreview.value_or_default() ? 1u : 0u;
+
+    const auto anchors =
+        ParseExposureTrimAnchorsRuntime(cfg.DlssNrAutoExposureTrimAnchors.value_or_default());
+    params.ExposureTrimAnchorCount = (uint32_t) std::min<size_t>(anchors.size(), 8);
+
+    // The sixteen float fields below are deliberately contiguous pairs in DlssNrConstants.
+    float* pairs = &params.ExposureTrimAnchorExposure0;
+    for (size_t i = 0; i < params.ExposureTrimAnchorCount; ++i)
+    {
+        pairs[i * 2 + 0] = anchors[i].exposure;
+        pairs[i * 2 + 1] = anchors[i].trim;
+    }
 }
 
 // Turns what the meter saw into the divisor the encode uses, or falls back to the slider.
@@ -1176,7 +1330,7 @@ float ResolveWhitePoint(const Config& cfg, bool isHdrBuffer)
     // menu. A game that hands over a real exposure has no business being driven by a buffer found by
     // its shape, and two sources fighting over one number is the class of bug worth making
     // unreachable rather than merely unlikely.
-    if (cfg.DlssNrWhitePointSource.value_or_default() == 2)
+    if (cfg.DlssNrWhitePointSource.value_or_default() == 3)
     {
         // Multi-point: one or more calibration points the user placed, interpolated in log space by
         // the current scan value. One point is the original ratio law; more fit the buffer's actual
@@ -1204,9 +1358,14 @@ float ResolveWhitePoint(const Config& cfg, bool isHdrBuffer)
         //
         // Their value is left in the config untouched, so switching back to manual restores the
         // number they arrived at. It is only what this path consumes that is limited.
-        const float trim = std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
+        const auto anchors =
+            ParseExposureTrimAnchorsRuntime(cfg.DlssNrGameExposureTrimAnchors.value_or_default());
+        const float baseWhitePoint = g_nr.gamePreExposure / g_nr.gameExposure;
+        const float trim = ExposureTrimForRuntime(
+            baseWhitePoint, cfg.DlssNrWhitePointTrim.value_or_default(), anchors,
+            cfg.DlssNrGameExposureTrimPreview.value_or_default());
 
-        return std::clamp(g_nr.gamePreExposure / g_nr.gameExposure * trim, 0.01f, 4096.0f);
+        return std::clamp(baseWhitePoint * trim, 0.01f, 4096.0f);
     }
 
     // Otherwise the slider, and only the slider.
@@ -1715,7 +1874,7 @@ DlssNr_Dx12::DlssNr_Dx12(std::string InName, ID3D12Device* InDevice)
 bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
                                   ID3D12Resource* InSource, ID3D12Resource* InModel,
                                   ID3D12Resource* InOriginal, ID3D12Resource* InMotion,
-                                  ID3D12Resource* InPrevEdit, ID3D12Resource* OutTarget,
+                                  ID3D12Resource* InExposure, ID3D12Resource* OutTarget,
                                   ID3D12Resource* OutKeep)
 {
     if (!_init || InCmdList == nullptr || _device == nullptr || InSource == nullptr || OutTarget == nullptr)
@@ -1734,7 +1893,7 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
         InModel != nullptr ? InModel : InSource,
         InOriginal != nullptr ? InOriginal : InSource,
         InMotion != nullptr ? InMotion : InSource,
-        InPrevEdit != nullptr ? InPrevEdit : InSource,
+        InExposure != nullptr ? InExposure : InSource,
     };
 
     for (uint32_t i = 0; i < kSrvCount; ++i)
@@ -1762,8 +1921,12 @@ bool DlssNr_Dx12::DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssN
 
     // Sized from the constants rather than from a resource, because the pass that shrinks the proxy
     // writes fewer pixels than its source has.
-    const UINT dispatchWidth = (InConstants.Width + _numThreadsX - 1) / _numThreadsX;
-    const UINT dispatchHeight = (InConstants.Height + _numThreadsY - 1) / _numThreadsY;
+    const bool parallelExposureMeter =
+        InConstants.Mode == DlssNrMode_Meter && InConstants.MeterCopiesExposure == 0;
+    const UINT dispatchWidth =
+        parallelExposureMeter ? InConstants.Width : (InConstants.Width + _numThreadsX - 1) / _numThreadsX;
+    const UINT dispatchHeight =
+        parallelExposureMeter ? InConstants.Height : (InConstants.Height + _numThreadsY - 1) / _numThreadsY;
     InCmdList->Dispatch(dispatchWidth, dispatchHeight, 1);
 
     return true;
@@ -2094,6 +2257,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         if (g_nr.meter != nullptr)
             LOG_INFO("DLSS-NR: white point meter up, {}x{} tiles", kDlssNrMeterGrid, kDlssNrMeterGrid);
+    }
+
+    if (g_nr.autoExposure == nullptr)
+    {
+        g_nr.autoExposure = CreateScratch(device, DXGI_FORMAT_R32_FLOAT, 1, 1);
+        g_nr.autoExposureReadable = false;
+
+        if (g_nr.autoExposure == nullptr)
+            LOG_WARN("DLSS-NR: could not allocate the 1x1 auto-exposure texture");
+        else
+            LOG_INFO("DLSS-NR: GPU auto exposure is available");
     }
 
     // On an engine that needs its compute state put back -- the bindless quirks -- the envelope can
@@ -2437,7 +2611,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // Gated on the source the menu actually writes. This read the retired WhitePointFromExposure
     // flag while consumption keyed on WhitePointSource == 1, so choosing "the game's own exposure"
     // never dispatched the meter and the white point silently fell back to the slider.
-    const bool exposureSettingOn = cfg.DlssNrWhitePointSource.value_or_default() == 1;
+    const uint32_t requestedExposureSource = cfg.DlssNrWhitePointSource.value_or_default();
+    if (requestedExposureSource != g_nr.exposureReadbackSource)
+    {
+        InvalidateExposureMeter();
+        g_nr.exposureReadbackSource = requestedExposureSource;
+    }
+
+    const bool exposureSettingOn = requestedExposureSource == 1;
 
     // Nothing held from before the option was switched off may survive switching it back on. See
     // InvalidateExposureMeter for what froze and why it read as a colour cast.
@@ -2460,6 +2641,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         // dead code the dispatch simply never reaches.
         meterParams.Width = 1;
         meterParams.Height = 1;
+        meterParams.MeterCopiesExposure = 1;
 
         // The game's exposure texture is read here as an SRV. D3D12 has no image layouts, so leaving
         // it alone costs nothing there; Vulkan does, and a read still requires a shader-readable
@@ -2494,6 +2676,71 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     g_nr.gamePreExposure = frame.PreExposure;
 
+    const uint32_t whitePointSource = cfg.DlssNrWhitePointSource.value_or_default();
+    const bool gameExposureSelected = whitePointSource == 1;
+    const bool automaticExposureSelected = whitePointSource == 2;
+
+    // Sources are mutually exclusive: auto ignores game ExposureTexture; game never falls back.
+    ID3D12Resource* nrExposure =
+        gameExposureSelected ? (ID3D12Resource*) frame.ExposureTexture : nullptr;
+    const bool nrExposureIsGame = nrExposure != nullptr;
+    bool usingAutoExposure = false;
+    const D3D12_RESOURCE_STATES exposureArrival =
+        cfg.ExposureResourceBarrier.has_value()
+            ? (D3D12_RESOURCE_STATES) cfg.ExposureResourceBarrier.value()
+            : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    if (automaticExposureSelected && isHdrBuffer &&
+        g_nr.meter != nullptr && g_nr.autoExposure != nullptr)
+    {
+        DlssNrConstants meterParams {};
+        meterParams.Mode = DlssNrMode_Meter;
+        meterParams.Width = kDlssNrMeterGrid;
+        meterParams.Height = kDlssNrMeterGrid;
+        meterParams.MeterCopiesExposure = 0;
+
+        Barrier(cmdList, source, sourceIdle, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        DispatchPass(cmdList, meterParams, source, nullptr, nullptr, nullptr, nullptr, g_nr.meter, nullptr);
+        Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
+
+        Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        if (g_nr.autoExposureReadable)
+            Barrier(cmdList, g_nr.autoExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        DlssNrConstants exposureParams {};
+        exposureParams.Mode = DlssNrMode_AutoExposure;
+        exposureParams.Width = 1;
+        exposureParams.Height = 1;
+        exposureParams.PreExposure = frame.PreExposure;
+        exposureParams.AutoExposureShadowProtection =
+            std::clamp(cfg.DlssNrAutoExposureShadowProtection.value_or_default(), 0.0f, 100.0f);
+        const D3D12_RESOURCE_DESC exposureSourceDesc = source->GetDesc();
+        exposureParams.ExposureSourceWidth = (uint32_t) exposureSourceDesc.Width;
+        exposureParams.ExposureSourceHeight = exposureSourceDesc.Height;
+
+        DispatchPass(cmdList, exposureParams, g_nr.meter, nullptr, nullptr, nullptr, nullptr,
+                     g_nr.autoExposure, nullptr);
+
+        Barrier(cmdList, g_nr.meter, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Barrier(cmdList, g_nr.autoExposure, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_nr.autoExposureReadable = true;
+        nrExposure = g_nr.autoExposure;
+        usingAutoExposure = true;
+
+        // UI and Anchor-point capture use a delayed CPU readback. The shader below still uses
+        // this frame's 1x1 texture directly, so Trim interpolation itself has no readback lag.
+        CopyAutoExposureToReadback(cmdList, frame.PreExposure);
+        ConsumeMeterReadback();
+    }
+
+    if (g_nr.setExposure != nullptr)
+        g_nr.setExposure(g_nr.capabilityParams, nrExposure);
+
     const float whitePoint = ResolveWhitePoint(cfg, isHdrBuffer);
 
     DlssNrConstants encodeParams {};
@@ -2502,13 +2749,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // the resolve adds the model's edit back at full scale.
     encodeParams.Passthrough = isHdrBuffer ? 0u : 1u;
     encodeParams.WhitePoint = whitePoint;
+    encodeParams.PreExposure = frame.PreExposure;
+    FillAutoExposureTrimConstants(encodeParams, cfg);
+    encodeParams.UseExposureWhitePoint = usingAutoExposure ? 1u : 0u;
     // Match only takes effect once a fit exists; until then the table is empty and the shader would
     // read a curve of zeros, so it falls back to the plain proxy.
     encodeParams.Width = width;
     encodeParams.Height = height;
 
     Barrier(cmdList, source, sourceIdle, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    DispatchPass(cmdList, encodeParams, source, nullptr, nullptr, nullptr, nullptr, g_nr.colorCopy, g_nr.hdrCopy);
+    DispatchPass(cmdList, encodeParams, source, nullptr, nullptr, nullptr,
+                 usingAutoExposure ? g_nr.autoExposure : nullptr, g_nr.colorCopy, g_nr.hdrCopy);
 
     Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, sourceIdle);
     // The transitions double as the wait for the encode's writes.
@@ -2655,6 +2906,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ++passes;
     }
 
+    if (g_nr.setExposure != nullptr && nrExposureIsGame)
+        Barrier(cmdList, nrExposure, exposureArrival,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
@@ -2710,6 +2965,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
 
+    if (g_nr.setExposure != nullptr && nrExposureIsGame)
+        Barrier(cmdList, nrExposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                exposureArrival);
+
     g_nr.reset = false;
 
     // Once, a few seconds in, so it lands after the values have been written at least once.
@@ -2761,6 +3020,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         DlssNrConstants resolveParams {};
         resolveParams.Mode = DlssNrMode_Resolve;
         resolveParams.WhitePoint = whitePoint;
+    resolveParams.PreExposure = frame.PreExposure;
+    FillAutoExposureTrimConstants(resolveParams, cfg);
+    resolveParams.UseExposureWhitePoint = usingAutoExposure ? 1u : 0u;
         resolveParams.Width = width;
         resolveParams.Height = height;
         resolveParams.TransferStrength = cfg.DlssNrTransferStrength.value_or_default();
@@ -2841,7 +3103,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         setWork(answer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         DispatchPass(cmdList, resolveParams, modelInput, work[answer], g_nr.hdrCopy, motionIn,
-                            nullptr, target, nullptr);
+                 usingAutoExposure ? g_nr.autoExposure : nullptr, target, nullptr);
         setWork(answer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         g_nr.wroteTarget = true;
@@ -3479,6 +3741,17 @@ ExposureStatus GameExposureStatus()
     return s;
 }
 
+ExposureStatus AutoExposureStatus()
+{
+    ExposureStatus s {};
+    s.seenFrames = g_nr.autoExposureFrames;
+    s.offeredNow = g_nr.autoExposureReadable;
+    s.everOffered = g_nr.autoExposureFrames != 0;
+    s.exposure = g_nr.autoExposureValue;
+    s.preExposure = g_nr.autoExposurePreExposure;
+    return s;
+}
+
 std::optional<double> LastGpuTime() { return g_lastGpuTime; }
 
 
@@ -3575,6 +3848,18 @@ void Shutdown()
         g_nr.meter = nullptr;
     }
 
+    if (g_nr.autoExposure != nullptr)
+    {
+        g_nr.autoExposure->Release();
+        g_nr.autoExposure = nullptr;
+    }
+
+    g_nr.autoExposureReadable = false;
+    g_nr.autoExposureValue = 0.0f;
+    g_nr.autoExposurePreExposure = 1.0f;
+    g_nr.autoExposureFrames = 0;
+    g_nr.exposureReadbackSource = 0;
+
     if (g_nr.calib != nullptr)
     {
         g_nr.calib->Release();
@@ -3611,8 +3896,8 @@ void Shutdown()
     // transition within the same scene, and dropping to the slider for a few frames would be the
     // flicker the held value exists to prevent. The user switching the option off is the case where
     // the held value has to go, and that is handled at the edge in Dispatch.
-    for (bool& valid : g_nr.meterExposureValid)
-        valid = false;
+    for (unsigned int& kind : g_nr.meterExposureKind)
+        kind = 0u;
 
     g_nr.meterFrames = 0;
 

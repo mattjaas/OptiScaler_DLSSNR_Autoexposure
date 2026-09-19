@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "SysUtils.h"
 #include "State.h"
@@ -427,8 +427,9 @@ class Config
     // Where the white point comes from. One control, because there is one answer.
     //
     //   0  the paper white slider, and nothing else
-    //   1  the exposure the game hands the upscaler
-    //   2  a buffer the scan found, anchored to a white point the user chose once
+    //   1  the exposure the game hands the upscaler (game only; no automatic fallback)
+    //   2  OptiScaler automatic exposure, calculated from the original linear-HDR frame
+    //   3  a buffer the scan found, anchored to a white point the user chose once
     //
     // This replaces two independent checkboxes that could both be on. They were made exclusive by
     // greying, which deadlocked -- each disabled the other, so once both were set the only way out
@@ -436,6 +437,20 @@ class Config
     // setting the user had made. Both were attempts to stop an illegal state being REACHED. A single
     // choice cannot reach it: there is nothing to keep consistent, because there is only one value.
     CustomOptional<uint32_t> DlssNrWhitePointSource { 1 };
+
+    // Separate trim for OptiScaler's own GPU-calculated exposure (WhitePointSource == 2).
+    CustomOptional<float> DlssNrAutoExposureTrim { 5.0f };
+    CustomOptional<float> DlssNrAutoExposureShadowProtection { 100.0f };
+
+    // Base-white-point-dependent Trim calibration tables, serialized as baseWhitePoint:trim pairs.
+    // The two sources are intentionally separate because their white-point scales need not match.
+    CustomOptional<std::string> DlssNrGameExposureTrimAnchors { std::string() };
+    CustomOptional<std::string> DlssNrAutoExposureTrimAnchors { std::string() };
+
+    // Calibration aid only. These are deliberately not persisted: after a restart anchors are
+    // active again, rather than a forgotten preview checkbox silently bypassing them.
+    CustomOptional<bool> DlssNrGameExposureTrimPreview { false };
+    CustomOptional<bool> DlssNrAutoExposureTrimPreview { false };
 
     CustomOptional<bool> DlssNrScanMeter { false };
 

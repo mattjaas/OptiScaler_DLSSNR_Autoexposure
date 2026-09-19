@@ -202,7 +202,7 @@ bool EnsureReadback(ID3D12Device* device)
 // panel.
 bool Wanted()
 {
-    return Config::Instance()->DlssNrWhitePointSource.value_or_default() == 2 ||
+    return Config::Instance()->DlssNrWhitePointSource.value_or_default() == 3 ||
            Config::Instance()->DlssNrScanExposure.value_or_default();
 }
 

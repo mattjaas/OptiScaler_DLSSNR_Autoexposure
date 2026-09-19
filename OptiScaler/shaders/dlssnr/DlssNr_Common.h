@@ -19,8 +19,9 @@ enum DlssNrMode : uint32_t
     DlssNrMode_Encode = 0,     // the frame -> a tone-mapped proxy, plus an untouched copy
     DlssNrMode_Resolve = 1,    // proxy + the model's answer + the untouched copy -> the edited frame
     DlssNrMode_Downsample = 2, // the proxy -> a smaller proxy, when the model works below full size
-    DlssNrMode_Meter = 3,      // the exposure texture -> tile (0,0), for the white point
-    DlssNrMode_Calibrate = 4   // the untouched frame -> a grid of tile peak luminances
+    DlssNrMode_Meter = 3,      // exposure copy, or frame -> 64x64 tile luminance means
+    DlssNrMode_Calibrate = 4,  // the untouched frame -> a grid of tile peak luminances
+    DlssNrMode_AutoExposure = 5 // 64x64 tile means -> NVIDIA-style 1x1 exposure texture
 };
 
 // The meter's grid. 64 x 64 tiles over the whole frame, whatever its size.
@@ -164,6 +165,33 @@ struct alignas(256) DlssNrConstants
     // two captures at different exposures then differ by the exposure, whatever the edit did. This
     // is the user's own multiplier, which holds still while the meter works.
     float DebugScale;
+
+    // Auto-exposure only. Appended so every existing field keeps its byte offset for Vulkan.
+    float PreExposure;
+    uint32_t ExposureSourceWidth;
+    uint32_t ExposureSourceHeight;
+    uint32_t MeterCopiesExposure;
+    float ExposureTrim;
+    uint32_t UseExposureWhitePoint;
+    uint32_t ExposureTrimAnchorCount;
+    uint32_t ExposureTrimPreview;
+    float ExposureTrimAnchorExposure0;
+    float ExposureTrimAnchorTrim0;
+    float ExposureTrimAnchorExposure1;
+    float ExposureTrimAnchorTrim1;
+    float ExposureTrimAnchorExposure2;
+    float ExposureTrimAnchorTrim2;
+    float ExposureTrimAnchorExposure3;
+    float ExposureTrimAnchorTrim3;
+    float ExposureTrimAnchorExposure4;
+    float ExposureTrimAnchorTrim4;
+    float ExposureTrimAnchorExposure5;
+    float ExposureTrimAnchorTrim5;
+    float ExposureTrimAnchorExposure6;
+    float ExposureTrimAnchorTrim6;
+    float ExposureTrimAnchorExposure7;
+    float ExposureTrimAnchorTrim7;
+    float AutoExposureShadowProtection;
 };
 
 class DlssNr_Common

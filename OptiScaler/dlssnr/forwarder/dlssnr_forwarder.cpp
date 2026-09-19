@@ -665,7 +665,7 @@ __declspec(dllexport) void *dlssnr_vk_create(void *cmdBuffer, void *capabilityPa
 // Filling it here rather than in the host keeps the two APIs from drifting: a parameter added to one
 // evaluate and forgotten in the other would be a bug that only appears on one backend.
 __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, void *capabilityParams,
-                                             void *color, void *depth, void *motion, void *output,
+                                             void *color, void *depth, void *motion, void *exposure, void *output,
                                              unsigned int width, unsigned int height,
                                              unsigned int guideWidth, unsigned int guideHeight,
                                              int depthInverted, int reset, float intensity, int style,
@@ -678,6 +678,7 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
     setResourcePtr(capabilityParams, "DLSSNR.Color", color);
     setResourcePtr(capabilityParams, "DLSSNR.Depth", depth);
     setResourcePtr(capabilityParams, "DLSSNR.MVec", motion);
+    setResourcePtr(capabilityParams, "ExposureTexture", exposure);
     setResourcePtr(capabilityParams, "DLSSNR.Output", output);
 
     // The block is shared with the game's own DLSS, which overwrites these between frames, so every
@@ -841,6 +842,15 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     // a return through this module, which is the whole reason this file exists.
     volatile int result = g_snip.evaluate(cmd, feature, capabilityParams, nullptr);
     return result;
+}
+
+// Standard NGX exposure input. Separate optional export keeps the positional evaluate ABI intact.
+__declspec(dllexport) void dlssnr_call_set_exposure(void *capabilityParams,
+                                                    ID3D12Resource *exposure) {
+    if (!capabilityParams) {
+        return;
+    }
+    setResource(capabilityParams, "ExposureTexture", exposure);
 }
 
 // Inputs NVIDIA's own Streamline plugin sets that the positional exports predate: the model's global

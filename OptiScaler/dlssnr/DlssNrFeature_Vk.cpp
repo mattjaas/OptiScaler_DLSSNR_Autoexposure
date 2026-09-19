@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "DlssNrFeature_Vk.h"
+#include "DlssNrFeature_Dx12.h"
 
 #include <Config.h>
 #include <State.h>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace DlssNr
 {
@@ -29,9 +31,9 @@ using PFN_VkProbe = int(__cdecl*)(const wchar_t*);
 using PFN_VkInit = int(__cdecl*)(const wchar_t*, const wchar_t*, void*, void*, void*, int);
 using PFN_VkCreate = void*(__cdecl*)(void*, void*, unsigned int, unsigned int, int, float, int, float, float, float,
                                      int, int);
-using PFN_VkEvaluate = int(__cdecl*)(void*, void*, void*, void*, void*, void*, void*, unsigned int, unsigned int,
-                                     unsigned int, unsigned int, int, int, float, int, float, float, float, int, float,
-                                     float);
+using PFN_VkEvaluate = int(__cdecl*)(void*, void*, void*, void*, void*, void*, void*, void*, unsigned int,
+                                     unsigned int, unsigned int, unsigned int, int, int, float, int, float, float,
+                                     float, int, float, float);
 using PFN_VkRelease = void(__cdecl*)(void*);
 
 // One image this pass owns: the storage, the view, and the NGX wrapper that describes it. Kept
@@ -126,14 +128,24 @@ struct VkState
     // frame-statistics meter that was removed from the shared shader, and 8x8 is here only so that a
     // single 8x8 thread group lands entirely inside the image.
     OwnedImage meter;
+    OwnedImage autoExposure;
     VkBuffer meterReadback[4] = {};
     VkDeviceMemory meterReadbackMemory[4] = {};
     void* meterMapped[4] = {};
     unsigned long long meterFrames = 0;
+    // 0 none, 1 game ExposureTexture, 2 OptiScaler automatic exposure.
+    uint32_t meterKind[4] = {};
+    float meterPreExposure[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    uint32_t exposureReadbackSource = 0;
+    float autoExposureValue = 0.0f;
+    float autoExposurePreExposure = 1.0f;
+    unsigned long long autoExposureFrames = 0;
+    bool autoExposureActive = false;
 };
 
-// The grid the meter writes, and the size of one readback. 8 * 8 * sizeof(float).
-constexpr uint32_t kMeterSide = 8;
+// Shared 64x64 luminance grid. Game-exposure mode only writes texel (0,0); automatic exposure
+// uses all 4096 tile means, matching the D3D12 path.
+constexpr uint32_t kMeterSide = 64;
 constexpr VkDeviceSize kMeterBytes = kMeterSide * kMeterSide * sizeof(float);
 
 // Four, so the slot being read is four frames behind the slot being written and the read never waits
@@ -427,6 +439,89 @@ bool LoadForwarder()
 }
 
 // Whether a format can hold linear, open-ended light. A frame the game already tone mapped has white
+struct VkExposureTrimAnchor
+{
+    float key = 0.0f;
+    float trim = 1.0f;
+};
+
+std::vector<VkExposureTrimAnchor> ParseExposureTrimAnchorsVk(const std::string& text)
+{
+    std::vector<VkExposureTrimAnchor> out;
+    size_t pos = 0;
+
+    while (pos < text.size() && out.size() < 8)
+    {
+        const size_t semi = text.find(';', pos);
+        const std::string token =
+            text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+        pos = semi == std::string::npos ? text.size() : semi + 1;
+
+        const size_t colon = token.find(':');
+        if (colon == std::string::npos)
+            continue;
+
+        try
+        {
+            const float key = std::stof(token.substr(0, colon));
+            const float trim = std::stof(token.substr(colon + 1));
+            if (std::isfinite(key) && key > 1e-8f && std::isfinite(trim) && trim > 0.0f)
+                out.push_back({ key, std::clamp(trim, 0.25f, 50.0f) });
+        }
+        catch (...)
+        {
+        }
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const VkExposureTrimAnchor& a, const VkExposureTrimAnchor& b) { return a.key < b.key; });
+    return out;
+}
+
+float ExposureTrimForRuntimeVk(float key, float fallback, const std::vector<VkExposureTrimAnchor>& anchors,
+                               bool preview)
+{
+    fallback = std::clamp(fallback, 0.25f, 50.0f);
+    if (preview || anchors.empty() || !(std::isfinite(key) && key > 1e-8f))
+        return fallback;
+    if (anchors.size() == 1)
+        return anchors[0].trim;
+    if (key <= anchors.front().key)
+        return anchors.front().trim;
+    if (key >= anchors.back().key)
+        return anchors.back().trim;
+
+    for (size_t i = 0; i + 1 < anchors.size(); ++i)
+    {
+        const auto& a = anchors[i];
+        const auto& b = anchors[i + 1];
+        if (key >= a.key && key <= b.key && b.key > a.key * 1.000001f)
+        {
+            const float t = (std::log(key) - std::log(a.key)) / (std::log(b.key) - std::log(a.key));
+            return std::clamp(std::exp(std::log(a.trim) + t * (std::log(b.trim) - std::log(a.trim))),
+                              0.25f, 50.0f);
+        }
+    }
+
+    return anchors.back().trim;
+}
+
+void FillAutoExposureTrimConstantsVk(DlssNrConstants& params, const Config& cfg)
+{
+    params.ExposureTrim = std::clamp(cfg.DlssNrAutoExposureTrim.value_or_default(), 0.25f, 50.0f);
+    params.ExposureTrimPreview = cfg.DlssNrAutoExposureTrimPreview.value_or_default() ? 1u : 0u;
+
+    const auto anchors = ParseExposureTrimAnchorsVk(cfg.DlssNrAutoExposureTrimAnchors.value_or_default());
+    params.ExposureTrimAnchorCount = (uint32_t) std::min<size_t>(anchors.size(), 8);
+
+    float* pairs = &params.ExposureTrimAnchorExposure0;
+    for (size_t i = 0; i < params.ExposureTrimAnchorCount; ++i)
+    {
+        pairs[i * 2 + 0] = anchors[i].key;
+        pairs[i * 2 + 1] = anchors[i].trim;
+    }
+}
+
 // at 1 and must not be encoded a second time; an 8-bit or normalised format cannot be scene-referred
 // whatever the game says. The D3D12 path asks the same question of DXGI formats.
 bool FormatCanHoldLinearHdr(VkFormat format)
@@ -572,22 +667,39 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
     if (havePre && std::isfinite(preExposure) && preExposure > 0.0f)
         g_vk.gamePreExposure = preExposure;
 
-    // Take the grid written four frames ago. Retired by now, so this reads mapped memory rather than
-    // waiting on the GPU -- which is the whole reason for the ring.
+    const uint32_t requestedWhitePointSource = cfg.DlssNrWhitePointSource.value_or_default();
+    if (requestedWhitePointSource != g_vk.exposureReadbackSource)
+    {
+        g_vk.exposureReadbackSource = requestedWhitePointSource;
+        g_vk.meterFrames = 0;
+        for (uint32_t& kind : g_vk.meterKind)
+            kind = 0u;
+        g_vk.autoExposureValue = 0.0f;
+        g_vk.autoExposurePreExposure = 1.0f;
+    }
+    g_vk.autoExposureActive = false;
+
+    // Take the value written four meter dispatches ago. Runtime never waits for this; it is only the
+    // menu/Anchor-point courier. The composition below reads this frame's GPU texture directly.
     if (g_vk.meterFrames >= kMeterSlots)
     {
-        const void* mapped = g_vk.meterMapped[g_vk.meterFrames % kMeterSlots];
+        const unsigned long long slot = g_vk.meterFrames % kMeterSlots;
+        const void* mapped = g_vk.meterMapped[slot];
 
         if (mapped != nullptr)
         {
             float measured = 0.0f;
             std::memcpy(&measured, mapped, sizeof(float));
-
-            // Believed only if it could be an exposure. A texel read through a layout the game did
-            // not leave it in, or a slot the game stopped filling, fails here and the last good
-            // value stands.
             if (std::isfinite(measured) && measured > 0.0f)
-                g_vk.gameExposure = measured;
+            {
+                if (g_vk.meterKind[slot] == 1u)
+                    g_vk.gameExposure = measured;
+                else if (g_vk.meterKind[slot] == 2u)
+                {
+                    g_vk.autoExposureValue = measured;
+                    g_vk.autoExposurePreExposure = g_vk.meterPreExposure[slot];
+                }
+            }
         }
     }
 
@@ -757,14 +869,16 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
 
         const VkFormat working = VK_FORMAT_R16G16B16A16_SFLOAT;
 
-        // The meter is a fixed 8x8 whatever the frame is, so it is only built the once -- but it is
-        // built alongside the rest so that a failure here is caught by the same check.
-        const bool meterReady = (g_vk.meter.Valid() || CreateImage(g_vk.meter, kMeterSide, kMeterSide,
-                                                                   VK_FORMAT_R32_SFLOAT, true)) &&
-                                CreateMeterReadback();
+        // Automatic exposure uses the same 64x64 tile-mean grid as D3D12, then reduces it into
+        // a one-pixel R32_FLOAT texture consumed directly by Encode/Resolve and by the NR feature.
+        const bool meterReady =
+            (g_vk.meter.Valid() ||
+             CreateImage(g_vk.meter, kMeterSide, kMeterSide, VK_FORMAT_R32_SFLOAT, true)) &&
+            (g_vk.autoExposure.Valid() || CreateImage(g_vk.autoExposure, 1, 1, VK_FORMAT_R32_SFLOAT, true)) &&
+            CreateMeterReadback();
 
         if (!meterReady)
-            LOG_WARN("DLSS-NR Vulkan: no exposure meter; the white point stays on the slider");
+            LOG_WARN("DLSS-NR Vulkan: no exposure meter; automatic exposure is unavailable");
 
         DestroyImage(g_vk.proxySmall);
 
@@ -847,10 +961,14 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
     // Their value stays in the config untouched, so switching back to manual restores it.
     float whitePoint = cfg.DlssNrWhitePointScale.value_or_default();
 
-    if (cfg.DlssNrWhitePointSource.value_or_default() == 1 && g_vk.gameExposure > 1e-6f)
+    if (requestedWhitePointSource == 1 && g_vk.gameExposure > 1e-6f)
     {
-        const float trim = std::clamp(cfg.DlssNrWhitePointTrim.value_or_default(), 0.25f, 4.0f);
-        whitePoint = std::clamp(g_vk.gamePreExposure / g_vk.gameExposure * trim, 0.01f, 4096.0f);
+        const float baseWhitePoint = g_vk.gamePreExposure / g_vk.gameExposure;
+        const auto anchors = ParseExposureTrimAnchorsVk(cfg.DlssNrGameExposureTrimAnchors.value_or_default());
+        const float trim = ExposureTrimForRuntimeVk(
+            baseWhitePoint, cfg.DlssNrWhitePointTrim.value_or_default(), anchors,
+            cfg.DlssNrGameExposureTrimPreview.value_or_default());
+        whitePoint = std::clamp(baseWhitePoint * trim, 0.01f, 4096.0f);
     }
 
     static bool saidEncoding = false;
@@ -876,6 +994,88 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
     encode.DebugScale = cfg.DlssNrWhitePointScale.value_or_default();
     encode.GuideWidth = guideWidth;
     encode.GuideHeight = guideHeight;
+
+    const float framePreExposure =
+        (std::isfinite(preExposure) && preExposure > 1e-6f) ? preExposure : 1.0f;
+    encode.PreExposure = framePreExposure;
+    encode.AutoExposureShadowProtection =
+        std::clamp(cfg.DlssNrAutoExposureShadowProtection.value_or_default(), 0.0f, 100.0f);
+    FillAutoExposureTrimConstantsVk(encode, cfg);
+    encode.UseExposureWhitePoint = 0u;
+
+    bool usingAutoExposure = false;
+
+    // Same-frame automatic exposure: raw linear HDR -> 64x64 exact tile means -> 1x1 exposure.
+    // The CPU readback recorded below is deliberately not consulted by Encode/Resolve.
+    if (requestedWhitePointSource == 2 && linearHdr && g_vk.meter.Valid() && g_vk.autoExposure.Valid())
+    {
+        DlssNrConstants meterParams = encode;
+        meterParams.Mode = DlssNrMode_Meter;
+        meterParams.Width = kMeterSide;
+        meterParams.Height = kMeterSide;
+        meterParams.MeterCopiesExposure = 0u;
+
+        Transition(cmdBuffer, g_vk.meter, VK_IMAGE_LAYOUT_GENERAL);
+
+        if (g_vk.pass->Dispatch(cmdBuffer, meterParams, kMeterSide, kMeterSide, sourceView, VK_NULL_HANDLE,
+                                VK_NULL_HANDLE, VK_NULL_HANDLE, g_vk.meter.view, VK_NULL_HANDLE, sourceLayout))
+        {
+            Transition(cmdBuffer, g_vk.meter, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            Transition(cmdBuffer, g_vk.autoExposure, VK_IMAGE_LAYOUT_GENERAL);
+
+            DlssNrConstants exposureParams = encode;
+            exposureParams.Mode = DlssNrMode_AutoExposure;
+            exposureParams.Width = 1;
+            exposureParams.Height = 1;
+            exposureParams.PreExposure = framePreExposure;
+            exposureParams.ExposureSourceWidth = width;
+            exposureParams.ExposureSourceHeight = height;
+
+            if (g_vk.pass->Dispatch(cmdBuffer, exposureParams, 1, 1, g_vk.meter.view, VK_NULL_HANDLE,
+                                    VK_NULL_HANDLE, VK_NULL_HANDLE, g_vk.autoExposure.view, VK_NULL_HANDLE))
+            {
+                Transition(cmdBuffer, g_vk.autoExposure, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                usingAutoExposure = true;
+                g_vk.autoExposureActive = true;
+                encode.UseExposureWhitePoint = 1u;
+
+                const unsigned long long slot = g_vk.meterFrames % kMeterSlots;
+                if (g_vk.meterReadback[slot] != VK_NULL_HANDLE)
+                {
+                    g_vk.meterKind[slot] = 2u;
+                    g_vk.meterPreExposure[slot] = framePreExposure;
+
+                    Transition(cmdBuffer, g_vk.autoExposure, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+                    VkBufferImageCopy region {};
+                    region.bufferOffset = 0;
+                    region.bufferRowLength = 0;
+                    region.bufferImageHeight = 0;
+                    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                    region.imageOffset = { 0, 0, 0 };
+                    region.imageExtent = { 1, 1, 1 };
+                    vkCmdCopyImageToBuffer(cmdBuffer, g_vk.autoExposure.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                           g_vk.meterReadback[slot], 1, &region);
+                    Transition(cmdBuffer, g_vk.autoExposure, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+                    VkBufferMemoryBarrier toHost {};
+                    toHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                    toHost.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toHost.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toHost.buffer = g_vk.meterReadback[slot];
+                    toHost.offset = 0;
+                    toHost.size = kMeterBytes;
+                    vkCmdPipelineBarrier(cmdBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0,
+                                         nullptr, 1, &toHost, 0, nullptr);
+
+                    g_vk.meterFrames++;
+                    g_vk.autoExposureFrames++;
+                }
+            }
+        }
+    }
 
     // Open the measurement. Reset immediately before writing: a query pool slot must be reset before
     // it is written again, and doing it here rather than at the end keeps the two in one place.
@@ -910,7 +1110,8 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
     }
 
     if (!g_vk.pass->Dispatch(cmdBuffer, encode, width, height, sourceView, VK_NULL_HANDLE, VK_NULL_HANDLE,
-                             VK_NULL_HANDLE, g_vk.proxy.view, g_vk.keep.view, encodeLayout))
+                             usingAutoExposure ? g_vk.autoExposure.view : VK_NULL_HANDLE, g_vk.proxy.view,
+                             g_vk.keep.view, encodeLayout))
     {
         Fail("the encode dispatch failed");
         return false;
@@ -966,6 +1167,10 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
             meter.Mode = DlssNrMode_Meter;
             meter.Width = kMeterSide;
             meter.Height = kMeterSide;
+            meter.MeterCopiesExposure = 1u;
+
+            g_vk.meterKind[slot] = 1u;
+            g_vk.meterPreExposure[slot] = g_vk.gamePreExposure;
 
             Transition(cmdBuffer, g_vk.meter, VK_IMAGE_LAYOUT_GENERAL);
 
@@ -1012,8 +1217,11 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
 
     Transition(cmdBuffer, g_vk.output, VK_IMAGE_LAYOUT_GENERAL);
 
+    NVSDK_NGX_Resource_VK* modelExposure = usingAutoExposure ? &g_vk.autoExposure.ngx : nullptr;
+
     const int evaluated = g_vk.evaluate(
-        (void*) cmdBuffer, g_vk.feature, g_vk.capabilityParams, &modelInput->ngx, depth, motion, &g_vk.output.ngx,
+        (void*) cmdBuffer, g_vk.feature, g_vk.capabilityParams, &modelInput->ngx, depth, motion, modelExposure,
+        &g_vk.output.ngx,
         workWidth, workHeight, guideWidth, guideHeight, depthInverted ? 1 : 0, g_vk.reset ? 1 : 0,
         cfg.DlssNrIntensity.value_or_default(), (int) cfg.DlssNrStyle.value_or_default(),
         cfg.DlssNrLocalStructure.value_or_default(), cfg.DlssNrLocalTone.value_or_default(),
@@ -1046,7 +1254,8 @@ bool EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, Vk
     // GENERAL. Unsplit that is the game's frame, arriving and staying in GENERAL. Split it belongs to
     // the caller's pipeline, which rests its surfaces there too, so neither is transitioned here.
     if (!g_vk.pass->Dispatch(cmdBuffer, resolve, width, height, modelInput->view, g_vk.output.view, g_vk.keep.view,
-                             VK_NULL_HANDLE, destView, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
+                             usingAutoExposure ? g_vk.autoExposure.view : VK_NULL_HANDLE, destView, VK_NULL_HANDLE,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))
     {
         Fail("the resolve dispatch failed");
         return false;
@@ -1198,6 +1407,30 @@ VkImageInfo StageInputSurfaceVk(VkCommandBuffer cmdBuffer, VkDevice device, VkPh
 
 bool StageCarriesTheModelVk() { return g_vk.stageEverRan && Config::Instance()->DlssNrDualFeature.value_or_default(); }
 
+ExposureStatus GameExposureStatusVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    ExposureStatus s {};
+    s.seenFrames = g_vk.meterFrames;
+    s.offeredNow = g_vk.exposureOffered;
+    s.everOffered = g_vk.exposureOffered || g_vk.gameExposure > 0.0f;
+    s.exposure = g_vk.gameExposure;
+    s.preExposure = g_vk.gamePreExposure;
+    return s;
+}
+
+ExposureStatus AutoExposureStatusVk()
+{
+    std::lock_guard<std::mutex> lock(g_vkMutex);
+    ExposureStatus s {};
+    s.seenFrames = g_vk.autoExposureFrames;
+    s.offeredNow = g_vk.autoExposureActive;
+    s.everOffered = g_vk.autoExposureFrames != 0;
+    s.exposure = g_vk.autoExposureValue;
+    s.preExposure = g_vk.autoExposurePreExposure;
+    return s;
+}
+
 void ShutdownVk(bool deviceAlive)
 {
     if (!deviceAlive)
@@ -1220,13 +1453,22 @@ void ShutdownVk(bool deviceAlive)
         g_vk.keep = OwnedImage {};
         g_vk.stageInput = OwnedImage {};
         g_vk.meter = OwnedImage {};
+        g_vk.autoExposure = OwnedImage {};
 
         for (int i = 0; i < 4; ++i)
         {
             g_vk.meterReadback[i] = VK_NULL_HANDLE;
             g_vk.meterReadbackMemory[i] = VK_NULL_HANDLE;
             g_vk.meterMapped[i] = nullptr;
+            g_vk.meterKind[i] = 0u;
+            g_vk.meterPreExposure[i] = 1.0f;
         }
+
+        g_vk.autoExposureValue = 0.0f;
+        g_vk.autoExposurePreExposure = 1.0f;
+        g_vk.autoExposureFrames = 0;
+        g_vk.autoExposureActive = false;
+        g_vk.exposureReadbackSource = 0;
 
         g_vk.device = VK_NULL_HANDLE;
         g_vk.width = 0;
@@ -1257,6 +1499,7 @@ void ShutdownVk(bool deviceAlive)
     DestroyImage(g_vk.keep);
     DestroyImage(g_vk.stageInput);
     DestroyImage(g_vk.meter);
+    DestroyImage(g_vk.autoExposure);
     DestroyMeterReadback();
 
     g_vk.pass.reset();
@@ -1275,6 +1518,13 @@ void ShutdownVk(bool deviceAlive)
 
     g_vk.timedFrames = 0;
     g_vk.lastGpuTime.reset();
+    g_vk.autoExposureValue = 0.0f;
+    g_vk.autoExposurePreExposure = 1.0f;
+    g_vk.autoExposureFrames = 0;
+    g_vk.autoExposureActive = false;
+    g_vk.exposureReadbackSource = 0;
+    for (uint32_t& kind : g_vk.meterKind)
+        kind = 0u;
 
     g_vk.device = VK_NULL_HANDLE;
     g_vk.width = 0;

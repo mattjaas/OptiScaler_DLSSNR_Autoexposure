@@ -163,6 +163,7 @@ struct ExposureStatus
 };
 
 ExposureStatus GameExposureStatus();
+ExposureStatus AutoExposureStatus();
 
 // The white point the exposure meter has settled on, or 0 if it has not taken a reading yet. For the
 // overlay, so the number in use is visible rather than inferred.

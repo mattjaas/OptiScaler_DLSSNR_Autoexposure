@@ -36,6 +36,8 @@ class Config;
 namespace DlssNr
 {
 
+struct ExposureStatus;
+
 // Runs the model over what the upscaler just wrote, on the same command buffer.
 //
 // Everything Vulkan needs that D3D12 does not is passed rather than looked up: the device handles
@@ -91,6 +93,11 @@ std::optional<double> LastGpuTimeVk();
 // binding the game's image means naming a layout this side cannot know. For the menu, and to settle
 // whether reading it is worth the risk on any real Vulkan game.
 bool ExposureOfferedVk();
+
+// Exposure values read back asynchronously for menu/status only. Runtime Vulkan composition
+// consumes the same-frame GPU textures directly.
+ExposureStatus GameExposureStatusVk();
+ExposureStatus AutoExposureStatusVk();
 
 void ShutdownVk(bool deviceAlive = true);
 

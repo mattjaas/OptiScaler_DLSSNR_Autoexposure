@@ -97,9 +97,8 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
     bool DispatchPass(ID3D12GraphicsCommandList* InCmdList, const DlssNrConstants& InConstants,
                   ID3D12Resource* InSource, ID3D12Resource* InModel, ID3D12Resource* InOriginal,
                   ID3D12Resource* InMotion,
-                  // Vestigial. Fed to the slot the removed edit accumulator read its history from;
-                  // nothing reads it now and every caller passes nullptr. Kept only so the binding
-                  // table keeps its shape -- not evidence that temporal accumulation exists.
-                  ID3D12Resource* InPrevEdit, ID3D12Resource* OutTarget,
+                  // Fifth SRV. Normally null; GPU auto exposure binds its 1x1 texture here for
+                  // encode and resolve. The descriptor-table shape is unchanged.
+                  ID3D12Resource* InExposure, ID3D12Resource* OutTarget,
                   ID3D12Resource* OutKeep);
 };
